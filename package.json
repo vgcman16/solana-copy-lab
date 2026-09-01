@@ -1,0 +1,40 @@
+{
+  "name": "solana-copy-lab",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.11.0",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "pnpm": {
+    "overrides": {
+      "jayson>uuid": "11.1.1"
+    },
+    "onlyBuiltDependencies": [
+      "@primno/dpapi",
+      "better-sqlite3",
+      "bufferutil",
+      "esbuild",
+      "utf-8-validate"
+    ]
+  },
+  "scripts": {
+    "dev": "concurrently -k -n server,web -c cyan,magenta \"corepack pnpm --filter @copylab/server dev\" \"corepack pnpm --filter @copylab/web dev\"",
+    "start": "corepack pnpm --filter @copylab/server start",
+    "build": "corepack pnpm -r build",
+    "pretypecheck": "corepack pnpm --filter @copylab/shared build && corepack pnpm --filter @copylab/core build && corepack pnpm --filter @copylab/providers build",
+    "typecheck": "corepack pnpm -r typecheck",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "check": "corepack pnpm typecheck && corepack pnpm test && corepack pnpm build"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.0",
+    "concurrently": "^9.2.1",
+    "tsx": "^4.21.0",
+    "tsup": "^8.5.1",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.18"
+  }
+}

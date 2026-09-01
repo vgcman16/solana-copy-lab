@@ -1,0 +1,23 @@
+[Unit]
+Description=CopyLab private Agave RPC node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sol
+Group=sol
+EnvironmentFile=-/etc/copylab/agave-rpc.env
+ExecStart=/home/sol/bin/agave-rpc-mainnet.sh
+Restart=always
+RestartSec=10
+LimitNOFILE=1000000
+LimitMEMLOCK=2000000000
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=/home/sol /mnt/ledger /mnt/accounts /mnt/snapshots
+
+[Install]
+WantedBy=multi-user.target

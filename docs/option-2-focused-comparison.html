@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>CopyLab Option 2 Focused Design QA</title>
+    <style>
+      * { box-sizing: border-box; }
+      html, body { margin: 0; background: #020a11; color: #edf5f7; font-family: Arial, sans-serif; }
+      main { width: max-content; padding: 18px; }
+      section { display: grid; gap: 18px; margin-bottom: 18px; }
+      .stage-row { grid-template-columns: repeat(2, 1018px); }
+      .rail-row { grid-template-columns: repeat(2, 469px); }
+      figure { margin: 0; border: 1px solid #183646; background: #06101b; }
+      figcaption { height: 38px; padding: 10px 14px; color: #a9f66f; font-size: 14px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+      .crop { position: relative; overflow: hidden; }
+      .stage-crop { width: 1018px; height: 294px; }
+      .rail-crop { width: 469px; height: 930px; }
+      .evidence-note { display: grid; place-items: center; height: 100%; padding: 32px; color: #92a6ae; font-size: 18px; line-height: 1.5; text-align: center; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <section class="stage-row">
+        <figure>
+          <figcaption>Reference · header, podium and metrics</figcaption>
+          <div class="crop stage-crop"><div class="evidence-note">Local design evidence intentionally excluded from the public repository.</div></div>
+        </figure>
+        <figure>
+          <figcaption>Implementation · header, podium and metrics</figcaption>
+          <div class="crop stage-crop"><div class="evidence-note">Local QA capture intentionally excluded from the public repository.</div></div>
+        </figure>
+      </section>
+      <section class="rail-row">
+        <figure>
+          <figcaption>Reference · observatory</figcaption>
+          <div class="crop rail-crop"><div class="evidence-note">Local design evidence intentionally excluded from the public repository.</div></div>
+        </figure>
+        <figure>
+          <figcaption>Implementation · observatory</figcaption>
+          <div class="crop rail-crop"><div class="evidence-note">Local QA capture intentionally excluded from the public repository.</div></div>
+        </figure>
+      </section>
+    </main>
+  </body>
+</html>

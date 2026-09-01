@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Review these values and `agave-validator --help` on every Agave upgrade.
+: "${RPC_IDENTITY:=/home/sol/rpc-identity.json}"
+: "${LEDGER_DIR:=/mnt/ledger}"
+: "${ACCOUNTS_DIR:=/mnt/accounts}"
+: "${SNAPSHOT_DIR:=/mnt/snapshots}"
+: "${RPC_BIND_ADDRESS:=127.0.0.1}"
+: "${RPC_PORT:=8899}"
+: "${DYNAMIC_PORT_RANGE:=8000-8030}"
+
+for path in "$RPC_IDENTITY" "$LEDGER_DIR" "$ACCOUNTS_DIR" "$SNAPSHOT_DIR"; do
+  if [[ ! -e "$path" ]]; then
+    echo "Required path is missing: $path" >&2
+    exit 1
+  fi
+done
+
+exec agave-validator \
+  --identity "$RPC_IDENTITY" \
+  --known-validator 7Np41oeYqPefeNQEHSv1UDhYrehxin3NStELsSKCT4K2 \
+  --known-validator GdnSyH3YtwcxFvQrVVJMm1JhTS4QVX7MFsX56uJLUfiZ \
+  --known-validator DE1bawNcRJB9rVm3buyMVfr8mBEoyyu73NBovf2oXJsJ \
+  --known-validator CakcnaRDHka2gXyfbEd2d3xsvkJkqsLw2akB3zsN1D2S \
+  --only-known-rpc \
+  --full-rpc-api \
+  --no-voting \
+  --private-rpc \
+  --enable-rpc-transaction-history \
+  --account-index spl-token-owner \
+  --ledger "$LEDGER_DIR" \
+  --accounts "$ACCOUNTS_DIR" \
+  --snapshots "$SNAPSHOT_DIR" \
+  --log /home/sol/agave-rpc.log \
+  --rpc-bind-address "$RPC_BIND_ADDRESS" \
+  --rpc-port "$RPC_PORT" \
+  --dynamic-port-range "$DYNAMIC_PORT_RANGE" \
+  --entrypoint entrypoint.mainnet-beta.solana.com:8001 \
+  --entrypoint entrypoint2.mainnet-beta.solana.com:8001 \
+  --entrypoint entrypoint3.mainnet-beta.solana.com:8001 \
+  --entrypoint entrypoint4.mainnet-beta.solana.com:8001 \
+  --entrypoint entrypoint5.mainnet-beta.solana.com:8001 \
+  --expected-genesis-hash 5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d
