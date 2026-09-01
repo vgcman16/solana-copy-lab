@@ -639,6 +639,90 @@ describe("isolated high-risk PAPER engine", () => {
     expect(repository.listPositions()).toEqual([]);
   });
 
+  it("keeps terminal no-route probes bounded after the streak threshold while token evidence is safe or unavailable", async () => {
+    const {
+      repository,
+      engine,
+      quote,
+      checkToken,
+      setNow
+    } = setup();
+    const buy = leaderSwap(
+      "research-terminal-evidence-retry-buy",
+      new Date("2026-07-13T12:00:00.000Z")
+    );
+    repository.insertSourceEvent(buy);
+    await engine.enqueue(researchAction(buy));
+
+    const open = repository.researchPaperDashboard().positions[0]!;
+    repository.upsertResearchPaperPosition({
+      ...open,
+      lastExecutableValueUsd: 0,
+      status: "UNPRICED",
+      exitQuoteFailureCount: 305,
+      consecutiveExitNoRouteFailureCount: 5,
+      lastExitQuoteAttemptAt: "2026-07-21T11:55:00.000Z",
+      nextExitQuoteRetryAt: "2026-07-21T12:00:00.000Z",
+      lastExitQuoteFailureCode: "JUPITER_EXIT_NO_ROUTE",
+      updatedAt: "2026-07-21T11:55:00.000Z"
+    });
+    quote.mockImplementation(async (request) => {
+      if (request.inputMint === MINT) {
+        throw new JupiterQuoteError(
+          "NO_ROUTES_FOUND",
+          "no executable route exists for the requested pair and amount"
+        );
+      }
+      return quoteFor(request, new Date("2026-07-21T12:00:00.000Z"));
+    });
+
+    // A fresh, eligible token snapshot is safe evidence, not terminal
+    // evidence. Reaching six no-route results therefore keeps the lot open and
+    // schedules exactly one probe for the next normal engine cycle.
+    setNow(new Date("2026-07-21T12:00:00.000Z"));
+    await engine.enqueueMarks("terminal-evidence:safe");
+    expect(repository.getResearchPaperPosition(open.id)).toMatchObject({
+      status: "UNPRICED",
+      exitQuoteFailureCount: 306,
+      consecutiveExitNoRouteFailureCount: 6,
+      lastExitQuoteFailureCode: "JUPITER_EXIT_NO_ROUTE",
+      nextExitQuoteRetryAt: "2026-07-21T12:04:00.000Z"
+    });
+    expect(repository.researchPaperDashboard().recentTrades).toEqual([]);
+    expect(checkToken).toHaveBeenCalledTimes(1);
+    expect(quote).toHaveBeenCalledTimes(3);
+
+    // Replaying the same mark nonce cannot manufacture another quote failure
+    // or another token-safety observation.
+    await engine.enqueueMarks("terminal-evidence:safe");
+    expect(checkToken).toHaveBeenCalledTimes(1);
+    expect(quote).toHaveBeenCalledTimes(3);
+
+    // An unavailable token-safety provider also cannot authorize a write-off,
+    // but it must not strand the aged zero-valued lot behind exponential hours.
+    checkToken.mockRejectedValueOnce(new Error("token evidence unavailable"));
+    setNow(new Date("2026-07-21T12:04:00.000Z"));
+    await engine.enqueueMarks("terminal-evidence:unavailable");
+    expect(repository.getResearchPaperPosition(open.id)).toMatchObject({
+      status: "UNPRICED",
+      exitQuoteFailureCount: 307,
+      consecutiveExitNoRouteFailureCount: 7,
+      lastExitQuoteFailureCode: "JUPITER_EXIT_NO_ROUTE",
+      nextExitQuoteRetryAt: "2026-07-21T12:08:00.000Z"
+    });
+    expect(repository.researchPaperDashboard().recentTrades).toEqual([]);
+    expect(checkToken).toHaveBeenCalledTimes(2);
+    expect(quote).toHaveBeenCalledTimes(4);
+
+    await engine.enqueueMarks("terminal-evidence:unavailable");
+    expect(checkToken).toHaveBeenCalledTimes(2);
+    expect(quote).toHaveBeenCalledTimes(4);
+    const markEvents = repository.listResearchPaperEvents({ laneId: "research-lane", limit: 100 })
+      .filter((event) => event.kind === "NAV_MARK");
+    expect(markEvents).toHaveLength(2);
+    expect(new Set(markEvents.map((event) => event.eventKey))).toHaveLength(2);
+  });
+
   it("resets consecutive no-route evidence during a temporary quote-service failure", async () => {
     const { repository, engine, quote, checkToken, setNow, setToken } = setup();
     const buy = leaderSwap("research-transient-writeoff-guard-buy", new Date("2026-07-13T12:00:00.000Z"));

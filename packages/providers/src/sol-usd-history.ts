@@ -1,9 +1,17 @@
 export const PYTH_SOL_USD_HISTORY_SOURCE = "pyth_benchmarks" as const;
 export const BIRDEYE_SOL_USD_HISTORY_SOURCE = "birdeye_ohlcv_v3" as const;
+/**
+ * A real Birdeye five-minute candle observed exactly one interval before the
+ * requested ten-minute grid point. The distinct source keeps that provenance
+ * durable without pretending the observation occurred at the requested time.
+ */
+export const BIRDEYE_SOL_USD_HISTORY_PREVIOUS_5M_SOURCE =
+  "birdeye_ohlcv_v3_prev_5m" as const;
 
 export type SolUsdHistorySource =
   | typeof PYTH_SOL_USD_HISTORY_SOURCE
-  | typeof BIRDEYE_SOL_USD_HISTORY_SOURCE;
+  | typeof BIRDEYE_SOL_USD_HISTORY_SOURCE
+  | typeof BIRDEYE_SOL_USD_HISTORY_PREVIOUS_5M_SOURCE;
 
 /**
  * Minimal, provider-independent evidence admitted by the durable SOL/USD
@@ -16,6 +24,12 @@ export interface SolUsdHistoricalPrice {
   requestedTimestampSeconds: number;
   observationTimestampSeconds: number;
   priceUsd: number;
+  /** Optional genuine provider observation immediately following the grid point. */
+  followingObservation?: {
+    source: SolUsdHistorySource;
+    observationTimestampSeconds: number;
+    priceUsd: number;
+  };
 }
 
 export interface SolUsdHistoricalPriceProvider {

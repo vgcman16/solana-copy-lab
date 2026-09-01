@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  BIRDEYE_SOL_USD_HISTORY_PREVIOUS_5M_SOURCE,
   BIRDEYE_SOL_USD_HISTORY_SOURCE,
   PYTH_SOL_USD_FEED_ID,
   PYTH_SOL_USD_HISTORY_SOURCE,
@@ -105,6 +106,36 @@ class FakeBirdeyeHistoryProvider implements SolUsdHistoricalPriceProvider {
       requestedTimestampSeconds: timestampSeconds,
       observationTimestampSeconds: timestampSeconds,
       priceUsd: 81.25
+    };
+  }
+}
+
+class FixedBirdeyeHistoryProvider implements SolUsdHistoricalPriceProvider {
+  readonly authenticationConfigured = true;
+  readonly pythAuthenticationConfigured = false;
+  readonly fallbackConfigured = true;
+
+  constructor(
+    readonly activeSource:
+      | typeof BIRDEYE_SOL_USD_HISTORY_SOURCE
+      | typeof BIRDEYE_SOL_USD_HISTORY_PREVIOUS_5M_SOURCE,
+    private readonly observationOffsetSeconds: number,
+    private readonly followingOffsetSeconds?: number
+  ) {}
+
+  async getSolUsdPrice(timestampSeconds: number) {
+    return {
+      source: this.activeSource,
+      requestedTimestampSeconds: timestampSeconds,
+      observationTimestampSeconds: timestampSeconds + this.observationOffsetSeconds,
+      priceUsd: 80.5,
+      ...(this.followingOffsetSeconds === undefined ? {} : {
+        followingObservation: {
+          source: BIRDEYE_SOL_USD_HISTORY_SOURCE,
+          observationTimestampSeconds: timestampSeconds + this.followingOffsetSeconds,
+          priceUsd: 80.75
+        }
+      })
     };
   }
 }
@@ -379,6 +410,197 @@ describe("SolPriceBootstrapWorker", () => {
     });
   });
 
+  it("accepts and durably records only the distinct previous-five-minute Birdeye provenance", async () => {
+    db = openDatabase(":memory:");
+    const repository = new Repository(db);
+    const worker = new SolPriceBootstrapWorker(
+      repository,
+      new FixedBirdeyeHistoryProvider(BIRDEYE_SOL_USD_HISTORY_PREVIOUS_5M_SOURCE, -300),
+      { now: () => new Date(NOW_ISO) }
+    );
+    worker.initializeAuthorized();
+    const target = repository.getSolPriceBootstrapCheckpoint()!.nextTimestampSeconds;
+
+    await expect(worker.runOnce()).resolves.toBe(true);
+    expect(repository.getSolPriceSnapshotAt(new Date(target * 1_000).toISOString())).toEqual({
+      capturedAt: new Date(target * 1_000).toISOString(),
+      priceUsd: 80.5,
+      source: BIRDEYE_SOL_USD_HISTORY_PREVIOUS_5M_SOURCE
+    });
+    expect(db.prepare(`
+      SELECT observed_at FROM sol_price_snapshots WHERE captured_at = ?
+    `).get(new Date(target * 1_000).toISOString())).toEqual({
+      observed_at: new Date((target - 300) * 1_000).toISOString()
+    });
+    expect(worker.status()).toMatchObject({ phase: "RUNNING", completedPoints: 1 });
+  });
+
+  it("atomically adds a real following candle for a previous-five-minute hole without changing grid counters", async () => {
+    db = openDatabase(":memory:");
+    const repository = new Repository(db);
+    const worker = new SolPriceBootstrapWorker(
+      repository,
+      new FixedBirdeyeHistoryProvider(BIRDEYE_SOL_USD_HISTORY_PREVIOUS_5M_SOURCE, -300, 300),
+      { now: () => new Date(NOW_ISO) }
+    );
+    worker.initializeAuthorized();
+    const target = repository.getSolPriceBootstrapCheckpoint()!.nextTimestampSeconds;
+
+    await worker.runOnce();
+
+    expect(repository.getSolPriceSnapshotAt(new Date((target + 300) * 1_000).toISOString())).toEqual({
+      capturedAt: new Date((target + 300) * 1_000).toISOString(),
+      priceUsd: 80.75,
+      source: BIRDEYE_SOL_USD_HISTORY_SOURCE
+    });
+    expect(worker.status()).toMatchObject({ completedPoints: 1, insertedSnapshots: 1, preservedSnapshots: 0 });
+  });
+
+  it("repairs an existing special row even when the provider now returns an exact main candle", async () => {
+    db = openDatabase(":memory:");
+    const repository = new Repository(db);
+    const worker = new SolPriceBootstrapWorker(
+      repository,
+      new FixedBirdeyeHistoryProvider(BIRDEYE_SOL_USD_HISTORY_SOURCE, 0, 300),
+      { now: () => new Date(NOW_ISO) }
+    );
+    worker.initializeAuthorized();
+    const target = repository.getSolPriceBootstrapCheckpoint()!.nextTimestampSeconds;
+    const targetAt = new Date(target * 1_000).toISOString();
+    repository.saveSolPriceSnapshot({
+      capturedAt: targetAt,
+      observedAt: new Date((target - 300) * 1_000).toISOString(),
+      priceUsd: 79,
+      source: BIRDEYE_SOL_USD_HISTORY_PREVIOUS_5M_SOURCE
+    });
+
+    await worker.runOnce();
+
+    expect(repository.getSolPriceSnapshotAt(targetAt)?.priceUsd).toBe(79);
+    expect(repository.getSolPriceSnapshotAt(new Date((target + 300) * 1_000).toISOString())?.priceUsd).toBe(80.75);
+    expect(worker.status()).toMatchObject({ completedPoints: 1, insertedSnapshots: 0, preservedSnapshots: 1 });
+  });
+
+  it("does not densify ordinary exact rows and never persists a future following candle", async () => {
+    db = openDatabase(":memory:");
+    const repository = new Repository(db);
+    const worker = new SolPriceBootstrapWorker(
+      repository,
+      new FixedBirdeyeHistoryProvider(BIRDEYE_SOL_USD_HISTORY_SOURCE, 0, 300),
+      { now: () => new Date(NOW_ISO) }
+    );
+    worker.initializeAuthorized();
+    const checkpoint = repository.getSolPriceBootstrapCheckpoint()!;
+    await worker.runOnce();
+    expect(repository.getSolPriceSnapshotAt(
+      new Date((checkpoint.nextTimestampSeconds + 300) * 1_000).toISOString()
+    )).toBeUndefined();
+
+    repository.saveSolPriceBootstrapCheckpoint({
+      ...repository.getSolPriceBootstrapCheckpoint()!,
+      nextTimestampSeconds: checkpoint.windowEndSeconds,
+      completedPoints: checkpoint.totalPoints - 1,
+      insertedSnapshots: checkpoint.totalPoints - 1,
+      preservedSnapshots: 0
+    });
+    const futureWorker = new SolPriceBootstrapWorker(
+      repository,
+      new FixedBirdeyeHistoryProvider(BIRDEYE_SOL_USD_HISTORY_PREVIOUS_5M_SOURCE, -300, 300),
+      { now: () => new Date(checkpoint.windowEndSeconds * 1_000) }
+    );
+    await futureWorker.runOnce();
+    expect(repository.getSolPriceSnapshotAt(new Date((checkpoint.windowEndSeconds + 300) * 1_000).toISOString())).toBeUndefined();
+  });
+
+  it("fails closed on malformed following-candle provenance", async () => {
+    db = openDatabase(":memory:");
+    const repository = new Repository(db);
+    const worker = new SolPriceBootstrapWorker(
+      repository,
+      new FixedBirdeyeHistoryProvider(BIRDEYE_SOL_USD_HISTORY_PREVIOUS_5M_SOURCE, -300, 600),
+      { now: () => new Date(NOW_ISO) }
+    );
+    worker.initializeAuthorized();
+    const target = repository.getSolPriceBootstrapCheckpoint()!.nextTimestampSeconds;
+    await worker.runOnce();
+    expect(worker.status()).toMatchObject({ phase: "FAILED", completedPoints: 0 });
+    expect(repository.getSolPriceSnapshotAt(new Date(target * 1_000).toISOString())).toBeUndefined();
+  });
+
+  it("persists the exact bounded-forward Pyth publish time as durable observation provenance", async () => {
+    const provider = new FakePythProvider(true);
+    const { repository, worker } = setup(provider);
+    worker.initializeAuthorized();
+    const target = repository.getSolPriceBootstrapCheckpoint()!.nextTimestampSeconds;
+    provider.outcomes.push({
+      ...price(target),
+      observationTimestampSeconds: target + 45,
+      publishTimeSeconds: target + 45
+    });
+
+    await expect(worker.runOnce()).resolves.toBe(true);
+    expect(db!.prepare(`
+      SELECT observed_at FROM sol_price_snapshots WHERE captured_at = ?
+    `).get(new Date(target * 1_000).toISOString())).toEqual({
+      observed_at: new Date((target + 45) * 1_000).toISOString()
+    });
+    expect(repository.nearestSolPriceSnapshot(
+      new Date(target * 1_000).toISOString(),
+      10 * 60_000
+    )).toBeUndefined();
+    expect(repository.nearestSolPriceSnapshot(
+      new Date((target + 45) * 1_000).toISOString(),
+      10 * 60_000
+    )).toMatchObject({ priceUsd: 78.5, source: PYTH_SOL_USD_HISTORY_SOURCE });
+  });
+
+  it.each([
+    ["earlier", -1],
+    ["too-far future", 61]
+  ] as const)("rejects %s Pyth publish evidence without advancing or persisting it", async (
+    _label,
+    offsetSeconds
+  ) => {
+    const provider = new FakePythProvider(true);
+    const { repository, worker } = setup(provider);
+    worker.initializeAuthorized();
+    const target = repository.getSolPriceBootstrapCheckpoint()!.nextTimestampSeconds;
+    provider.outcomes.push({
+      ...price(target),
+      observationTimestampSeconds: target + offsetSeconds,
+      publishTimeSeconds: target + offsetSeconds
+    });
+
+    await expect(worker.runOnce()).resolves.toBe(true);
+    expect(worker.status()).toMatchObject({ phase: "FAILED", completedPoints: 0 });
+    expect(repository.getSolPriceSnapshotAt(new Date(target * 1_000).toISOString())).toBeUndefined();
+  });
+
+  it.each([
+    ["normal source with a previous observation", BIRDEYE_SOL_USD_HISTORY_SOURCE, -300],
+    ["previous source with an exact observation", BIRDEYE_SOL_USD_HISTORY_PREVIOUS_5M_SOURCE, 0],
+    ["previous source with a future observation", BIRDEYE_SOL_USD_HISTORY_PREVIOUS_5M_SOURCE, 300],
+    ["previous source with an older observation", BIRDEYE_SOL_USD_HISTORY_PREVIOUS_5M_SOURCE, -600]
+  ] as const)("rejects %s", async (_label, source, observationOffsetSeconds) => {
+    db = openDatabase(":memory:");
+    const repository = new Repository(db);
+    const worker = new SolPriceBootstrapWorker(
+      repository,
+      new FixedBirdeyeHistoryProvider(source, observationOffsetSeconds),
+      { now: () => new Date(NOW_ISO) }
+    );
+    worker.initializeAuthorized();
+    const target = repository.getSolPriceBootstrapCheckpoint()!.nextTimestampSeconds;
+
+    await expect(worker.runOnce()).resolves.toBe(true);
+    expect(worker.status()).toMatchObject({
+      phase: "FAILED",
+      completedPoints: 0,
+      lastError: "Birdeye SOL/USD history response failed strict validation (CANDLE_TIME)."
+    });
+    expect(repository.getSolPriceSnapshotAt(new Date(target * 1_000).toISOString())).toBeUndefined();
+  });
+
   it("persists retry timing and attempts for transient 429 failures", async () => {
     let now = new Date(NOW_ISO);
     const provider = new FakePythProvider();
@@ -445,6 +667,7 @@ describe("SolPriceBootstrapWorker", () => {
     worker.initializeAuthorized();
     const checkpoint = repository.getSolPriceBootstrapCheckpoint()!;
     const capturedAt = new Date(checkpoint.nextTimestampSeconds * 1_000).toISOString();
+    const supplementalAt = new Date((checkpoint.nextTimestampSeconds + 300) * 1_000).toISOString();
     const advanced: SolPriceBootstrapCheckpoint = {
       ...checkpoint,
       nextTimestampSeconds: checkpoint.nextTimestampSeconds + SOL_PRICE_BOOTSTRAP_INTERVAL_SECONDS,
@@ -458,10 +681,20 @@ describe("SolPriceBootstrapWorker", () => {
       BEGIN SELECT RAISE(ABORT, 'simulated cursor crash'); END;
     `);
 
-    expect(() => repository.commitSolPriceBootstrapPoint({ capturedAt, priceUsd: 78.5 }, advanced)).toThrow(
+    expect(() => repository.commitSolPriceBootstrapPoint({
+      capturedAt,
+      observedAt: capturedAt,
+      priceUsd: 78.5
+    }, advanced, {
+      capturedAt: supplementalAt,
+      observedAt: supplementalAt,
+      priceUsd: 78.75,
+      source: BIRDEYE_SOL_USD_HISTORY_SOURCE
+    })).toThrow(
       "simulated cursor crash"
     );
     expect(repository.getSolPriceSnapshotAt(capturedAt)).toBeUndefined();
+    expect(repository.getSolPriceSnapshotAt(supplementalAt)).toBeUndefined();
     expect(repository.getSolPriceBootstrapCheckpoint()).toEqual(checkpoint);
   });
 

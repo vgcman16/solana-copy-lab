@@ -3248,18 +3248,27 @@ export class Repository implements ManagedRecoveryPreflightRepository {
   listWalletIndexResearchShortlist(limit = 50): WalletIndexRecord[] {
     const boundedLimit = Math.max(0, Math.min(10_000, Math.trunc(limit)));
     const rows = this.db.prepare(`
-      SELECT record_json FROM wallet_index
-      WHERE prescreen_eligible = 1
-        AND COALESCE(json_extract(record_json, '$.deepHistoryStatus'), '') = 'COMPLETE'
-        AND COALESCE(json_extract(record_json, '$.structuralEligible'), 0) = 1
+      SELECT wi.record_json FROM wallet_index AS wi
+      WHERE wi.prescreen_eligible = 1
+        AND COALESCE(json_extract(wi.record_json, '$.deepHistoryStatus'), '') = 'COMPLETE'
+        AND COALESCE(json_extract(wi.record_json, '$.structuralEligible'), 0) = 1
+        AND NOT EXISTS (
+          SELECT 1 FROM wallet_index_dirty AS dirty WHERE dirty.wallet = wi.wallet
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM indexed_spot_swaps AS swap INDEXED BY indexed_spot_swaps_wallet_time
+          JOIN indexed_swap_reprice_queue AS queue ON queue.swap_id = swap.id
+          WHERE swap.wallet = wi.wallet AND queue.status = 'PENDING'
+        )
       ORDER BY
-        closed_eligible_swaps DESC,
-        history_days DESC,
-        active_weeks DESC,
-        median_holding_minutes DESC,
-        eligible_spot_swap_count DESC,
-        successful_transaction_count DESC,
-        wallet
+        wi.closed_eligible_swaps DESC,
+        wi.history_days DESC,
+        wi.active_weeks DESC,
+        wi.median_holding_minutes DESC,
+        wi.eligible_spot_swap_count DESC,
+        wi.successful_transaction_count DESC,
+        wi.wallet
       LIMIT ?
     `).all(boundedLimit) as Array<{ record_json: string }>;
     return rows.map((row) => decode<WalletIndexRecord>(row.record_json));
@@ -5521,6 +5530,25 @@ export class Repository implements ManagedRecoveryPreflightRepository {
     return (row as { count: number }).count;
   }
 
+  /**
+   * Fail-closed research fence for a wallet whose local aggregate or SOL/USD
+   * source evidence is not settled yet. Both probes use bounded indexed reads.
+   */
+  hasPendingWalletIndexMaintenance(wallet: string): boolean {
+    const normalized = wallet.trim();
+    if (!normalized) throw new Error("Wallet index maintenance lookup requires a wallet.");
+    if (this.db.prepare(`
+      SELECT 1 FROM wallet_index_dirty WHERE wallet = ? LIMIT 1
+    `).get(normalized)) return true;
+    return Boolean(this.db.prepare(`
+      SELECT 1
+      FROM indexed_spot_swaps AS swap INDEXED BY indexed_spot_swaps_wallet_time
+      JOIN indexed_swap_reprice_queue AS queue ON queue.swap_id = swap.id
+      WHERE swap.wallet = ? AND queue.status = 'PENDING'
+      LIMIT 1
+    `).get(normalized));
+  }
+
   listEligibleIndexedSpotSwapsBetween(
     wallet: string,
     windowStart: string,
@@ -6866,21 +6894,43 @@ export class Repository implements ManagedRecoveryPreflightRepository {
     };
   }
 
-  saveSolPriceSnapshot(snapshot: { capturedAt: string; priceUsd: number; source: string }): void {
-    if (!Number.isFinite(Date.parse(snapshot.capturedAt))) throw new Error("SOL price capture time is invalid.");
+  saveSolPriceSnapshot(snapshot: {
+    capturedAt: string;
+    observedAt?: string;
+    priceUsd: number;
+    source: string;
+  }): void {
+    const capturedTimestamp = Date.parse(snapshot.capturedAt);
+    if (!Number.isFinite(capturedTimestamp)) throw new Error("SOL price capture time is invalid.");
+    const observedTimestamp = Date.parse(snapshot.observedAt ?? snapshot.capturedAt);
+    if (!Number.isFinite(observedTimestamp)) throw new Error("SOL price observation time is invalid.");
+    const observedAt = new Date(observedTimestamp).toISOString();
     if (!Number.isFinite(snapshot.priceUsd) || snapshot.priceUsd <= 0) {
       throw new Error("SOL price must be positive.");
     }
     if (!snapshot.source.trim()) throw new Error("SOL price source is required.");
     const source = snapshot.source.trim();
-    const existing = this.getSolPriceSnapshotAt(snapshot.capturedAt);
+    const existing = this.db.prepare(`
+      SELECT observed_at, price_usd, source
+      FROM sol_price_snapshots
+      WHERE captured_at = ?
+    `).get(snapshot.capturedAt) as {
+      observed_at: string;
+      price_usd: number;
+      source: string;
+    } | undefined;
     if (existing) {
-      if (existing.priceUsd === snapshot.priceUsd && existing.source === source) return;
+      if (
+        existing.observed_at === observedAt
+        && existing.price_usd === snapshot.priceUsd
+        && existing.source === source
+      ) return;
       throw new Error("A frozen SOL price timestamp cannot be overwritten with different evidence.");
     }
     this.db.prepare(`
-      INSERT INTO sol_price_snapshots(captured_at, price_usd, source) VALUES (?, ?, ?)
-    `).run(snapshot.capturedAt, snapshot.priceUsd, source);
+      INSERT INTO sol_price_snapshots(captured_at, observed_at, price_usd, source)
+      VALUES (?, ?, ?, ?)
+    `).run(snapshot.capturedAt, observedAt, snapshot.priceUsd, source);
     this.solPriceCoverageAggregateCache = undefined;
   }
 
@@ -6897,10 +6947,15 @@ export class Repository implements ManagedRecoveryPreflightRepository {
    * Existing exact timestamps, including newer Jupiter captures, are retained.
    */
   commitSolPriceBootstrapPoint(
-    snapshot: { capturedAt: string; priceUsd: number; source?: string },
-    advancedCheckpoint: SolPriceBootstrapCheckpoint
-  ): { inserted: boolean; checkpoint: SolPriceBootstrapCheckpoint } {
-    if (!Number.isFinite(Date.parse(snapshot.capturedAt))) throw new Error("SOL price capture time is invalid.");
+    snapshot: { capturedAt: string; observedAt: string; priceUsd: number; source?: string },
+    advancedCheckpoint: SolPriceBootstrapCheckpoint,
+    supplementalSnapshot?: { capturedAt: string; observedAt: string; priceUsd: number; source: string }
+  ): { inserted: boolean; supplementalInserted: boolean; checkpoint: SolPriceBootstrapCheckpoint } {
+    const capturedTimestamp = Date.parse(snapshot.capturedAt);
+    if (!Number.isFinite(capturedTimestamp)) throw new Error("SOL price capture time is invalid.");
+    const observedTimestamp = Date.parse(snapshot.observedAt);
+    if (!Number.isFinite(observedTimestamp)) throw new Error("SOL price observation time is invalid.");
+    const observedAt = new Date(observedTimestamp).toISOString();
     if (!Number.isFinite(snapshot.priceUsd) || snapshot.priceUsd <= 0) {
       throw new Error("SOL price must be positive.");
     }
@@ -6908,20 +6963,48 @@ export class Repository implements ManagedRecoveryPreflightRepository {
     if (!SOL_PRICE_BOOTSTRAP_SOURCES.has(source)) {
       throw new Error("SOL price bootstrap source is not approved.");
     }
+    if (supplementalSnapshot) {
+      const supplementalCapturedTimestamp = Date.parse(supplementalSnapshot.capturedAt);
+      const supplementalObservedTimestamp = Date.parse(supplementalSnapshot.observedAt);
+      if (!Number.isFinite(supplementalCapturedTimestamp)
+        || !Number.isFinite(supplementalObservedTimestamp)) {
+        throw new Error("Supplemental SOL price time is invalid.");
+      }
+      if (supplementalCapturedTimestamp !== supplementalObservedTimestamp) {
+        throw new Error("Supplemental SOL price must be stored at its real observation time.");
+      }
+      if (!Number.isFinite(supplementalSnapshot.priceUsd) || supplementalSnapshot.priceUsd <= 0) {
+        throw new Error("Supplemental SOL price must be positive.");
+      }
+      if (!SOL_PRICE_BOOTSTRAP_SOURCES.has(supplementalSnapshot.source)) {
+        throw new Error("Supplemental SOL price bootstrap source is not approved.");
+      }
+    }
     const result = this.db.transaction(() => {
       const inserted = this.db.prepare(`
-        INSERT OR IGNORE INTO sol_price_snapshots(captured_at, price_usd, source)
-        VALUES (?, ?, ?)
-      `).run(snapshot.capturedAt, snapshot.priceUsd, source).changes === 1;
+        INSERT OR IGNORE INTO sol_price_snapshots(captured_at, observed_at, price_usd, source)
+        VALUES (?, ?, ?, ?)
+      `).run(snapshot.capturedAt, observedAt, snapshot.priceUsd, source).changes === 1;
+      const supplementalInserted = supplementalSnapshot
+        ? this.db.prepare(`
+            INSERT OR IGNORE INTO sol_price_snapshots(captured_at, observed_at, price_usd, source)
+            VALUES (?, ?, ?, ?)
+          `).run(
+            supplementalSnapshot.capturedAt,
+            new Date(Date.parse(supplementalSnapshot.observedAt)).toISOString(),
+            supplementalSnapshot.priceUsd,
+            supplementalSnapshot.source
+          ).changes === 1
+        : false;
       const checkpoint: SolPriceBootstrapCheckpoint = {
         ...advancedCheckpoint,
         insertedSnapshots: advancedCheckpoint.insertedSnapshots + (inserted ? 1 : 0),
         preservedSnapshots: advancedCheckpoint.preservedSnapshots + (inserted ? 0 : 1)
       };
       this.saveSolPriceBootstrapCheckpoint(checkpoint);
-      return { inserted, checkpoint };
+      return { inserted, supplementalInserted, checkpoint };
     })();
-    if (result.inserted) this.solPriceCoverageAggregateCache = undefined;
+    if (result.inserted || result.supplementalInserted) this.solPriceCoverageAggregateCache = undefined;
     return result;
   }
 
@@ -6944,11 +7027,12 @@ export class Repository implements ManagedRecoveryPreflightRepository {
     }
     const start = new Date(requested - maximumDistanceMs).toISOString();
     const row = this.db.prepare(`
-      SELECT captured_at, price_usd, source FROM sol_price_snapshots
-      WHERE captured_at BETWEEN ? AND ?
-      ORDER BY captured_at DESC
+      SELECT captured_at, price_usd, source
+      FROM sol_price_snapshots
+      WHERE observed_at BETWEEN ? AND ?
+      ORDER BY observed_at DESC, captured_at DESC
       LIMIT 1
-    `).get(start, requestedAt) as {
+    `).get(start, new Date(requested).toISOString()) as {
       captured_at: string;
       price_usd: number;
       source: string;
@@ -6968,15 +7052,16 @@ export class Repository implements ManagedRecoveryPreflightRepository {
       const row = this.db.prepare(`
         WITH ordered AS (
           SELECT
-            captured_at,
-            LAG(captured_at) OVER (ORDER BY captured_at) AS previous_at
+            observed_at,
+            LAG(observed_at) OVER (ORDER BY observed_at, captured_at) AS previous_observed_at
           FROM sol_price_snapshots
         )
         SELECT
           COUNT(*) AS count,
-          MIN(captured_at) AS oldest_at,
-          MAX(captured_at) AS newest_at,
-          MAX((julianday(captured_at) - julianday(previous_at)) * 86400.0) AS largest_gap_seconds
+          MIN(observed_at) AS oldest_at,
+          MAX(observed_at) AS newest_at,
+          MAX((julianday(observed_at) - julianday(previous_observed_at)) * 86400.0)
+            AS largest_gap_seconds
         FROM ordered
       `).get() as {
         count: number;

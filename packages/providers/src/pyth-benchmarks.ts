@@ -260,7 +260,8 @@ export class PythBenchmarksClient implements PythBenchmarksPriceProvider {
       typeof publishTime !== "number"
       || !Number.isSafeInteger(publishTime)
       || publishTime <= 0
-      || Math.abs(publishTime - requestedTimestampSeconds) > this.maximumPublishDistanceSeconds
+      || publishTime < requestedTimestampSeconds
+      || publishTime > requestedTimestampSeconds + this.maximumPublishDistanceSeconds
     ) {
       throw new PythBenchmarksValidationError("PUBLISH_TIME");
     }

@@ -115,7 +115,10 @@ export interface SolPriceBootstrapStatus {
   /** Redacted provider capability; never exposes either credential. */
   pythAuthenticationConfigured?: boolean;
   managedFallbackConfigured?: boolean;
-  activeSource?: "pyth_benchmarks" | "birdeye_ohlcv_v3";
+  activeSource?:
+    | "pyth_benchmarks"
+    | "birdeye_ohlcv_v3"
+    | "birdeye_ohlcv_v3_prev_5m";
   checkpointValid: boolean;
   feedId: string;
   intervalSeconds: number;

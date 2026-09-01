@@ -159,6 +159,34 @@ describe("autonomous executable shadow learning", () => {
     expect(classifyMarketRegime(undefined, candidates)).toBe("UNKNOWN");
   });
 
+  it("checks learning integrity at lifecycle boundaries instead of every overview read", async () => {
+    mainDatabase = openDatabase(":memory:");
+    learningDatabase = openLearningDatabase(":memory:");
+    const repository = new Repository(mainDatabase);
+    const learning = new AutonomousLearningRepository(learningDatabase);
+    const integrityCheck = vi.spyOn(learning, "integrityCheck")
+      .mockReturnValueOnce("corrupt")
+      .mockReturnValue("ok");
+    const engine = new AutonomousLearningEngine(repository, learning, {
+      quote: async () => {
+        throw new Error("No quote should be requested by an integrity projection test.");
+      },
+      lookupMints: async () => [],
+      solPriceUsd: () => 0
+    });
+
+    expect(integrityCheck).toHaveBeenCalledTimes(1);
+    expect(engine.overview().status).toBe("DEGRADED");
+    expect(engine.overview().status).toBe("DEGRADED");
+    expect(integrityCheck).toHaveBeenCalledTimes(1);
+
+    const trained = await engine.train(true);
+    expect(integrityCheck).toHaveBeenCalledTimes(2);
+    expect(trained.status).not.toBe("DEGRADED");
+    engine.overview();
+    expect(integrityCheck).toHaveBeenCalledTimes(2);
+  });
+
   it("moves a deduplicated quote-only path through 15, 45, and 180 minute labels without trading", async () => {
     mainDatabase = openDatabase(":memory:");
     learningDatabase = openLearningDatabase(":memory:");

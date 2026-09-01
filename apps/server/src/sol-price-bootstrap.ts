@@ -1,4 +1,5 @@
 import {
+  BIRDEYE_SOL_USD_HISTORY_PREVIOUS_5M_SOURCE,
   BIRDEYE_SOL_USD_HISTORY_SOURCE,
   BirdeyeSolUsdHistoryRequestError,
   BirdeyeSolUsdHistoryValidationError,
@@ -205,14 +206,28 @@ function sanitizedProviderFailure(error: unknown): {
 
 function assertPrice(price: SolUsdHistoricalPrice, timestampSeconds: number): void {
   if (
-    (price.source !== PYTH_SOL_USD_HISTORY_SOURCE && price.source !== BIRDEYE_SOL_USD_HISTORY_SOURCE)
+    (
+      price.source !== PYTH_SOL_USD_HISTORY_SOURCE
+      && price.source !== BIRDEYE_SOL_USD_HISTORY_SOURCE
+      && price.source !== BIRDEYE_SOL_USD_HISTORY_PREVIOUS_5M_SOURCE
+    )
     || price.requestedTimestampSeconds !== timestampSeconds
     || !Number.isSafeInteger(price.observationTimestampSeconds)
-    || Math.abs(price.observationTimestampSeconds - timestampSeconds) > MAXIMUM_PUBLISH_DISTANCE_SECONDS
     || !Number.isFinite(price.priceUsd)
     || price.priceUsd <= 0
   ) {
     throw new PythBenchmarksValidationError("PRICE_SHAPE");
+  }
+  if (price.followingObservation) {
+    const following = price.followingObservation;
+    if (
+      following.source !== BIRDEYE_SOL_USD_HISTORY_SOURCE
+      || following.observationTimestampSeconds !== timestampSeconds + 5 * 60
+      || !Number.isFinite(following.priceUsd)
+      || following.priceUsd <= 0
+    ) {
+      throw new BirdeyeSolUsdHistoryValidationError("CANDLE_TIME");
+    }
   }
   if (price.source === BIRDEYE_SOL_USD_HISTORY_SOURCE) {
     if (price.observationTimestampSeconds !== timestampSeconds) {
@@ -220,11 +235,26 @@ function assertPrice(price: SolUsdHistoricalPrice, timestampSeconds: number): vo
     }
     return;
   }
+  if (price.source === BIRDEYE_SOL_USD_HISTORY_PREVIOUS_5M_SOURCE) {
+    if (price.observationTimestampSeconds !== timestampSeconds - 5 * 60) {
+      throw new BirdeyeSolUsdHistoryValidationError("CANDLE_TIME");
+    }
+    return;
+  }
   const pyth = price as PythBenchmarksSolUsdPrice;
+  // Hermes' timestamp endpoint returns the first update at or after the
+  // requested time. Retain that real publish time, but bound the forward delay
+  // and require both provenance fields to identify the same update.
+  const observationDelaySeconds = price.observationTimestampSeconds - timestampSeconds;
+  const publishDelaySeconds = pyth.publishTimeSeconds - timestampSeconds;
   if (
-    pyth.feedId !== PYTH_SOL_USD_FEED_ID
+    observationDelaySeconds < 0
+    || observationDelaySeconds > MAXIMUM_PUBLISH_DISTANCE_SECONDS
+    || pyth.feedId !== PYTH_SOL_USD_FEED_ID
     || !Number.isSafeInteger(pyth.publishTimeSeconds)
-    || Math.abs(pyth.publishTimeSeconds - timestampSeconds) > MAXIMUM_PUBLISH_DISTANCE_SECONDS
+    || publishDelaySeconds < 0
+    || publishDelaySeconds > MAXIMUM_PUBLISH_DISTANCE_SECONDS
+    || pyth.publishTimeSeconds !== price.observationTimestampSeconds
     || !/^[1-9]\d*$/.test(pyth.priceMantissa)
     || !/^\d+$/.test(pyth.confidenceMantissa)
     || !Number.isSafeInteger(pyth.exponent)
@@ -547,11 +577,25 @@ export class SolPriceBootstrapWorker {
         updatedAt: iso(this.now()),
         ...(complete ? { completedAt: iso(this.now()) } : {})
       };
+      const targetAt = new Date(target * 1_000).toISOString();
+      const existingTarget = this.repository.getSolPriceSnapshotAt(targetAt);
+      const following = price.followingObservation;
+      const supplementalEligible = following
+        && (price.source === BIRDEYE_SOL_USD_HISTORY_PREVIOUS_5M_SOURCE
+          || existingTarget?.source === BIRDEYE_SOL_USD_HISTORY_PREVIOUS_5M_SOURCE)
+        && following.observationTimestampSeconds <= Math.floor(now.getTime() / 1_000)
+        && following.observationTimestampSeconds <= checkpoint.windowEndSeconds;
       const committed = this.repository.commitSolPriceBootstrapPoint({
-        capturedAt: new Date(target * 1_000).toISOString(),
+        capturedAt: targetAt,
+        observedAt: new Date(price.observationTimestampSeconds * 1_000).toISOString(),
         priceUsd: price.priceUsd,
         source: price.source
-      }, advanced);
+      }, advanced, supplementalEligible ? {
+        capturedAt: new Date(following.observationTimestampSeconds * 1_000).toISOString(),
+        observedAt: new Date(following.observationTimestampSeconds * 1_000).toISOString(),
+        priceUsd: following.priceUsd,
+        source: following.source
+      } : undefined);
       if (complete) {
         this.repository.audit(
           "sol_price_bootstrap_complete",
@@ -563,7 +607,11 @@ export class SolPriceBootstrapWorker {
           }
         );
       }
-      const progressInterval = price.source === BIRDEYE_SOL_USD_HISTORY_SOURCE ? 250 : 10;
+      const progressInterval =
+        price.source === BIRDEYE_SOL_USD_HISTORY_SOURCE
+        || price.source === BIRDEYE_SOL_USD_HISTORY_PREVIOUS_5M_SOURCE
+          ? 250
+          : 10;
       if (complete || committed.checkpoint.completedPoints % progressInterval === 0) {
         this.onProgress(this.status());
       }

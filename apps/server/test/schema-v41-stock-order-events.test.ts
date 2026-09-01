@@ -29,7 +29,7 @@ describe("schema v41 stock PAPER order-event ledger", () => {
 
     db = openDatabase(databasePath);
     expect(db.pragma("user_version", { simple: true })).toBe(COPYLAB_SCHEMA_VERSION);
-    expect(COPYLAB_SCHEMA_VERSION).toBe(45);
+    expect(COPYLAB_SCHEMA_VERSION).toBe(47);
     expect((db.pragma("table_info(stock_paper_order_events)") as Array<{ name: string }>)
       .map((column) => column.name)).toEqual([
       "id",

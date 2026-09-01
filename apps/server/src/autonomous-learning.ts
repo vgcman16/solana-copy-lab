@@ -735,12 +735,28 @@ function attribution(row: { episode: ShadowEpisode; label: OutcomeLabel }): Trad
 export class AutonomousLearningEngine {
   private tail: Promise<void> = Promise.resolve();
   private training = false;
+  private learningIntegrityStatus: string;
 
   constructor(
     private readonly repository: Repository,
     private readonly learning: AutonomousLearningRepository,
     private readonly options: AutonomousLearningOptions
-  ) {}
+  ) {
+    // A full SQLite integrity check reads the entire learning database. Run it
+    // at controlled lifecycle boundaries, not from the frequently refreshed
+    // dashboard projection. Any non-ok result (including a thrown check) is
+    // retained fail-closed and reported as DEGRADED by overview().
+    this.learningIntegrityStatus = this.refreshLearningIntegrityStatus();
+  }
+
+  private refreshLearningIntegrityStatus(): string {
+    try {
+      this.learningIntegrityStatus = this.learning.integrityCheck();
+    } catch {
+      this.learningIntegrityStatus = "integrity_check_failed";
+    }
+    return this.learningIntegrityStatus;
+  }
 
   private now(): Date {
     return this.options.now?.() ?? new Date();
@@ -1273,6 +1289,10 @@ export class AutonomousLearningEngine {
       this.options.onUpdate?.({ outcome: "LEARNING_TRAINED" });
     } finally {
       this.training = false;
+      // Training replaces multiple durable model artifacts. Recheck the
+      // database after that mutation boundary so a cached healthy status can
+      // never survive a failed/corrupt training commit.
+      this.refreshLearningIntegrityStatus();
     }
     return this.overview();
   }
@@ -1745,7 +1765,7 @@ export class AutonomousLearningEngine {
       databaseSchemaVersion: LEARNING_SCHEMA_VERSION,
       status: this.training
         ? "TRAINING"
-        : this.learning.integrityCheck() !== "ok"
+        : this.learningIntegrityStatus !== "ok"
           ? "DEGRADED"
           : activeModels.length === AUTONOMOUS_MODEL_REQUIRED_ARTIFACTS ? "READY" : "COLLECTING",
       currentRegime,

@@ -27,8 +27,8 @@ describe("schema v45 PAPER marketplace", () => {
 
     db = openDatabase(path);
 
-    expect(COPYLAB_SCHEMA_VERSION).toBe(45);
-    expect(db.pragma("user_version", { simple: true })).toBe(45);
+    expect(COPYLAB_SCHEMA_VERSION).toBe(47);
+    expect(db.pragma("user_version", { simple: true })).toBe(COPYLAB_SCHEMA_VERSION);
     const tables = db.prepare(`
       SELECT name FROM sqlite_master
       WHERE type = 'table' AND name LIKE 'marketplace_%'

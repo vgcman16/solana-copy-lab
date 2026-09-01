@@ -39,7 +39,7 @@ function phaseDescription(status: SolPriceBootstrapStatus): string {
   if (status.phase === "IDLE") return "Optional and dormant. It will not make a request until you explicitly start it.";
   if (status.phase === "RUNNING") {
     return status.activeInProcess
-      ? "Fetching bounded provider pages and committing exact ten-minute points. Existing timestamps from every source stay untouched."
+      ? "Fetching bounded provider pages and committing exact ten-minute points or distinctly labeled previous-five-minute evidence. Existing timestamps from every source stay untouched."
       : "The authorized cursor is durable and resumes automatically after a healthy SETUP or PAPER restart.";
   }
   if (status.phase === "RETRY_WAIT") return "A transient provider failure is waiting for its durable retry time.";
@@ -69,6 +69,8 @@ export function SolPriceBootstrapControl({
   const canPause = solPriceBootstrapPauseAllowed(status);
   const canChangeKey = pythBenchmarksCredentialChangeAllowed(appMode);
   const pythConfigured = status.pythAuthenticationConfigured ?? status.authenticationConfigured;
+  const birdeyeActive = status.activeSource === "birdeye_ohlcv_v3"
+    || status.activeSource === "birdeye_ohlcv_v3_prev_5m";
   const expected = action === "pause"
     ? PAUSE_PYTH_BOOTSTRAP_CONFIRMATION
     : START_PYTH_BOOTSTRAP_CONFIRMATION;
@@ -178,7 +180,7 @@ export function SolPriceBootstrapControl({
         <article><span>Inserted</span><strong>{count(status.insertedSnapshots)}</strong><small>Provider-proven empty timestamps</small></article>
         <article><span>Preserved</span><strong>{count(status.preservedSnapshots)}</strong><small>Existing sources not overwritten</small></article>
         <article><span>Remaining</span><strong>{count(status.remainingPoints)}</strong><small>Ten-minute grid points</small></article>
-        <article><span>History source</span><strong>{status.activeSource === "birdeye_ohlcv_v3" ? "Birdeye fallback" : status.activeSource === "pyth_benchmarks" && (status.pythAuthenticationConfigured ?? status.authenticationConfigured) ? "Pyth" : "Not configured"}</strong><small>{status.pythAuthenticationConfigured ? "Pyth bearer configured" : status.managedFallbackConfigured ? "Managed credential configured" : "No provider credential"}</small></article>
+        <article><span>History source</span><strong>{birdeyeActive ? "Birdeye fallback" : status.activeSource === "pyth_benchmarks" && (status.pythAuthenticationConfigured ?? status.authenticationConfigured) ? "Pyth" : "Not configured"}</strong><small>{status.activeSource === "birdeye_ohlcv_v3_prev_5m" ? "Previous real 5m candle used" : status.pythAuthenticationConfigured ? "Pyth bearer configured" : status.managedFallbackConfigured ? "Managed credential configured" : "No provider credential"}</small></article>
       </div>
 
       <div className={`bootstrap-note ${status.phase === "FAILED" || !status.checkpointValid ? "bootstrap-note-error" : ""}`}>

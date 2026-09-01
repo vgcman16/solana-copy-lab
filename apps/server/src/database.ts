@@ -4,7 +4,7 @@ import { dirname, resolve } from "node:path";
 
 export type CopyLabDatabase = Database.Database;
 
-export const COPYLAB_SCHEMA_VERSION = 45;
+export const COPYLAB_SCHEMA_VERSION = 47;
 export const STOCK_V41_EVIDENCE_ACTIVATION_SETTING_KEY =
   "stock_paper_v41_evidence_activation";
 
@@ -330,6 +330,91 @@ function migrateMarketplaceV45(db: CopyLabDatabase): void {
   }
 }
 
+/**
+ * The autonomous dashboard retains a large rejection-heavy event ledger. Its
+ * material-decision and simulated-exit projections have different predicates
+ * from the candidate-retention index, so without exact partial indexes SQLite
+ * must walk the full lane history whenever the dashboard cache expires.
+ */
+function migrateAutonomousDashboardIndexesV46(db: CopyLabDatabase): void {
+  db.transaction(() => {
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS autonomous_paper_events_dashboard_material
+        ON autonomous_paper_events(lane_id, observed_at DESC, event_key DESC)
+        WHERE kind IN ('DECISION', 'TRADE')
+          AND outcome IN ('SIMULATED', 'REJECTED', 'ANALYSIS_ONLY', 'FAILED')
+          AND (action IN ('BUY', 'SELL') OR outcome = 'FAILED');
+
+      CREATE INDEX IF NOT EXISTS autonomous_paper_events_dashboard_simulated_sell
+        ON autonomous_paper_events(lane_id, observed_at DESC, event_key DESC)
+        WHERE kind = 'TRADE'
+          AND action = 'SELL'
+          AND outcome = 'SIMULATED';
+    `);
+    db.pragma("user_version = 46");
+  })();
+}
+
+/**
+ * v46 keyed SOL/USD rows only by the requested grid time and discarded the
+ * provider's real observation time. Rebuild the small insert-only ledger so
+ * future evidence retains both identities. The one labeled Birdeye fallback
+ * has deterministic legacy provenance (exactly five minutes earlier); all
+ * other legacy rows retain their previous captured-time semantics because an
+ * exact historical observation cannot be reconstructed without inventing it.
+ */
+function upgradeSolPriceObservationSchemaV47(db: CopyLabDatabase): boolean {
+  if (!tableExists(db, "sol_price_snapshots")) return false;
+  if (!tableColumnNames(db, "sol_price_snapshots").includes("observed_at")) {
+    db.exec(`
+      ALTER TABLE sol_price_snapshots RENAME TO sol_price_snapshots_v46;
+
+      CREATE TABLE sol_price_snapshots (
+        captured_at TEXT PRIMARY KEY,
+        observed_at TEXT NOT NULL,
+        price_usd REAL NOT NULL CHECK(price_usd > 0),
+        source TEXT NOT NULL
+      );
+
+      INSERT INTO sol_price_snapshots(captured_at, observed_at, price_usd, source)
+      SELECT
+        captured_at,
+        CASE
+          WHEN source = 'birdeye_ohlcv_v3_prev_5m'
+            THEN strftime('%Y-%m-%dT%H:%M:%fZ', captured_at, '-5 minutes')
+          ELSE strftime('%Y-%m-%dT%H:%M:%fZ', captured_at)
+        END,
+        price_usd,
+        source
+      FROM sol_price_snapshots_v46;
+
+      DROP TABLE sol_price_snapshots_v46;
+
+      CREATE INDEX sol_price_snapshot_time
+        ON sol_price_snapshots(captured_at DESC);
+      CREATE INDEX sol_price_snapshot_observation_time
+        ON sol_price_snapshots(observed_at DESC, captured_at DESC);
+    `);
+  } else {
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS sol_price_snapshot_time
+        ON sol_price_snapshots(captured_at DESC);
+      CREATE INDEX IF NOT EXISTS sol_price_snapshot_observation_time
+        ON sol_price_snapshots(observed_at DESC, captured_at DESC);
+    `);
+  }
+  return true;
+}
+
+function migrateSolPriceObservationV47(db: CopyLabDatabase): void {
+  db.transaction(() => {
+    if (!upgradeSolPriceObservationSchemaV47(db)) {
+      throw new Error("The v46 SOL price ledger is missing and cannot be migrated safely.");
+    }
+    db.pragma("user_version = 47");
+  })();
+}
+
 function migrate(db: CopyLabDatabase): void {
   const version = db.pragma("user_version", { simple: true }) as number;
   if (version > COPYLAB_SCHEMA_VERSION) {
@@ -338,6 +423,19 @@ function migrate(db: CopyLabDatabase): void {
     );
   }
   if (version === COPYLAB_SCHEMA_VERSION) {
+    ensureStockV41EvidenceActivationMarker(db);
+    return;
+  }
+
+  if (version === 46) {
+    migrateSolPriceObservationV47(db);
+    ensureStockV41EvidenceActivationMarker(db);
+    return;
+  }
+
+  if (version === 45) {
+    migrateAutonomousDashboardIndexesV46(db);
+    migrateSolPriceObservationV47(db);
     ensureStockV41EvidenceActivationMarker(db);
     return;
   }
@@ -537,6 +635,15 @@ function migrate(db: CopyLabDatabase): void {
     } finally {
       if (foreignKeysWereEnabled) db.pragma("foreign_keys = ON");
     }
+  }
+
+  // Older ledgers continue through the idempotent all-schema block below. Add
+  // the v47 column first so that block can safely create its observation index;
+  // the schema version is written only after every remaining migration passes.
+  if (version > 0 && version < 45 && tableExists(db, "sol_price_snapshots")) {
+    db.transaction(() => {
+      upgradeSolPriceObservationSchemaV47(db);
+    })();
   }
 
   db.exec(`
@@ -1034,11 +1141,14 @@ function migrate(db: CopyLabDatabase): void {
 
     CREATE TABLE IF NOT EXISTS sol_price_snapshots (
       captured_at TEXT PRIMARY KEY,
+      observed_at TEXT NOT NULL,
       price_usd REAL NOT NULL CHECK(price_usd > 0),
       source TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS sol_price_snapshot_time
       ON sol_price_snapshots(captured_at DESC);
+    CREATE INDEX IF NOT EXISTS sol_price_snapshot_observation_time
+      ON sol_price_snapshots(observed_at DESC, captured_at DESC);
 
     CREATE TABLE IF NOT EXISTS leader_lots (
       source_entry_signature TEXT PRIMARY KEY,
@@ -1335,6 +1445,18 @@ function migrate(db: CopyLabDatabase): void {
 
     CREATE INDEX IF NOT EXISTS autonomous_paper_events_entry_cadence
       ON autonomous_paper_events(lane_id, kind, action, outcome, observed_at);
+
+    CREATE INDEX IF NOT EXISTS autonomous_paper_events_dashboard_material
+      ON autonomous_paper_events(lane_id, observed_at DESC, event_key DESC)
+      WHERE kind IN ('DECISION', 'TRADE')
+        AND outcome IN ('SIMULATED', 'REJECTED', 'ANALYSIS_ONLY', 'FAILED')
+        AND (action IN ('BUY', 'SELL') OR outcome = 'FAILED');
+
+    CREATE INDEX IF NOT EXISTS autonomous_paper_events_dashboard_simulated_sell
+      ON autonomous_paper_events(lane_id, observed_at DESC, event_key DESC)
+      WHERE kind = 'TRADE'
+        AND action = 'SELL'
+        AND outcome = 'SIMULATED';
 
     -- High-volume REJECT/OBSERVE detail is retained only for a bounded recent
     -- audit window. Older terminal candidate decisions are atomically folded

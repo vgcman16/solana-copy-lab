@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { SOL_MINT } from "@copylab/shared";
 import {
+  BIRDEYE_SOL_USD_HISTORY_PREVIOUS_5M_SOURCE,
   BIRDEYE_SOL_USD_HISTORY_SOURCE,
   BirdeyeSolUsdHistoryClient,
   BirdeyeSolUsdHistoryRequestError,
@@ -51,7 +52,12 @@ describe("BirdeyeSolUsdHistoryClient", () => {
       source: BIRDEYE_SOL_USD_HISTORY_SOURCE,
       requestedTimestampSeconds: START,
       observationTimestampSeconds: START,
-      priceUsd: 150
+      priceUsd: 150,
+      followingObservation: {
+        source: BIRDEYE_SOL_USD_HISTORY_SOURCE,
+        observationTimestampSeconds: START + 300,
+        priceUsd: 151
+      }
     });
     await expect(client.getSolUsdPrice(START + 600)).resolves.toMatchObject({ priceUsd: 152 });
     expect(requests).toHaveLength(1);
@@ -65,9 +71,140 @@ describe("BirdeyeSolUsdHistoryClient", () => {
     expect(reservations).toEqual([45]);
   });
 
-  it("fails closed rather than interpolating or padding a missing exact target", async () => {
+  it("performs one focused three-candle fetch and prefers an exact candle recovered there", async () => {
+    const requests: URL[] = [];
+    let call = 0;
     const client = new BirdeyeSolUsdHistoryClient("managed-birdeye-key", {
-      maximumCandlesPerRequest: 2,
+      maximumCandlesPerRequest: 3,
+      minimumRequestIntervalMs: 0,
+      fetch: mockFetch((url) => {
+        requests.push(url);
+        call += 1;
+        return jsonResponse({
+          success: true,
+          data: {
+            items: call === 1
+              ? [candle(START + 300, 151)]
+              : [candle(START - 300, 149), candle(START, 150), candle(START + 300, 151)]
+          }
+        });
+      })
+    });
+    await expect(client.getSolUsdPrice(START)).resolves.toEqual({
+      source: BIRDEYE_SOL_USD_HISTORY_SOURCE,
+      requestedTimestampSeconds: START,
+      observationTimestampSeconds: START,
+      priceUsd: 150,
+      followingObservation: {
+        source: BIRDEYE_SOL_USD_HISTORY_SOURCE,
+        observationTimestampSeconds: START + 300,
+        priceUsd: 151
+      }
+    });
+    expect(requests).toHaveLength(2);
+    expect(requests[1]?.searchParams.get("time_from")).toBe(String(START - 300));
+    expect(requests[1]?.searchParams.get("time_to")).toBe(String(START + 300));
+    expect(requests[1]?.searchParams.get("padding")).toBe("false");
+  });
+
+  it("uses the previous real candle when the focused neighborhood confirms the exact hole", async () => {
+    const requests: URL[] = [];
+    const reservations: number[] = [];
+    let call = 0;
+    const client = new BirdeyeSolUsdHistoryClient("managed-birdeye-key", {
+      maximumCandlesPerRequest: 3,
+      minimumRequestIntervalMs: 0,
+      onRequest: ({ credits }) => reservations.push(credits),
+      fetch: mockFetch((url) => {
+        requests.push(url);
+        call += 1;
+        return jsonResponse({
+          success: true,
+          data: {
+            items: call === 1
+              ? [candle(START + 300, 151)]
+              : [candle(START - 300, 149), candle(START + 300, 151)]
+          }
+        });
+      })
+    });
+    await expect(client.getSolUsdPrice(START)).resolves.toEqual({
+      source: BIRDEYE_SOL_USD_HISTORY_PREVIOUS_5M_SOURCE,
+      requestedTimestampSeconds: START,
+      observationTimestampSeconds: START - 300,
+      priceUsd: 149,
+      followingObservation: {
+        source: BIRDEYE_SOL_USD_HISTORY_SOURCE,
+        observationTimestampSeconds: START + 300,
+        priceUsd: 151
+      }
+    });
+    expect(requests[1]?.searchParams.get("time_from")).toBe(String(START - 300));
+    expect(requests[1]?.searchParams.get("time_to")).toBe(String(START + 300));
+    expect(reservations).toEqual([45, 45]);
+  });
+
+  it("uses only one focused request when a prior broad page already proves the omission", async () => {
+    const requests: URL[] = [];
+    let call = 0;
+    const target = START + 600;
+    const client = new BirdeyeSolUsdHistoryClient("managed-birdeye-key", {
+      maximumCandlesPerRequest: 5,
+      minimumRequestIntervalMs: 0,
+      fetch: mockFetch((url) => {
+        requests.push(url);
+        call += 1;
+        return jsonResponse({
+          success: true,
+          data: {
+            items: call === 1
+              ? [
+                  candle(START, 150),
+                  candle(START + 300, 151),
+                  candle(START + 900, 153),
+                  candle(START + 1_200, 154)
+                ]
+              : [candle(target - 300, 151), candle(target + 300, 153)]
+          }
+        });
+      })
+    });
+
+    await expect(client.getSolUsdPrice(START)).resolves.toMatchObject({ priceUsd: 150 });
+    await expect(client.getSolUsdPrice(target)).resolves.toMatchObject({
+      source: BIRDEYE_SOL_USD_HISTORY_PREVIOUS_5M_SOURCE,
+      observationTimestampSeconds: target - 300,
+      priceUsd: 151
+    });
+    expect(requests).toHaveLength(2);
+    expect(requests[1]?.searchParams.get("time_from")).toBe(String(target - 300));
+    expect(requests[1]?.searchParams.get("time_to")).toBe(String(target + 300));
+  });
+
+  it("accepts only the real previous five-minute candle under distinct provenance", async () => {
+    let call = 0;
+    const client = new BirdeyeSolUsdHistoryClient("managed-birdeye-key", {
+      maximumCandlesPerRequest: 3,
+      minimumRequestIntervalMs: 0,
+      fetch: mockFetch(() => {
+        call += 1;
+        return jsonResponse({
+          success: true,
+          data: { items: call === 1 ? [] : [candle(START - 300, 149)] }
+        });
+      })
+    });
+    await expect(client.getSolUsdPrice(START)).resolves.toEqual({
+      source: BIRDEYE_SOL_USD_HISTORY_PREVIOUS_5M_SOURCE,
+      requestedTimestampSeconds: START,
+      observationTimestampSeconds: START - 300,
+      priceUsd: 149
+    });
+  });
+
+  it("rejects a future-only focused neighborhood rather than looking ahead", async () => {
+    const client = new BirdeyeSolUsdHistoryClient("managed-birdeye-key", {
+      maximumCandlesPerRequest: 3,
       minimumRequestIntervalMs: 0,
       fetch: mockFetch(() => jsonResponse({
         success: true,
@@ -77,6 +214,22 @@ describe("BirdeyeSolUsdHistoryClient", () => {
     const error = await client.getSolUsdPrice(START).catch((caught: unknown) => caught);
     expect(error).toBeInstanceOf(BirdeyeSolUsdHistoryValidationError);
     expect(error).toMatchObject({ code: "TARGET_MISSING" });
+  });
+
+  it("rejects an older-only focused response rather than extending the lookback", async () => {
+    let call = 0;
+    const client = new BirdeyeSolUsdHistoryClient("managed-birdeye-key", {
+      maximumCandlesPerRequest: 3,
+      minimumRequestIntervalMs: 0,
+      fetch: mockFetch(() => {
+        call += 1;
+        return jsonResponse({
+          success: true,
+          data: { items: call === 1 ? [] : [candle(START - 600)] }
+        });
+      })
+    });
+    await expect(client.getSolUsdPrice(START)).rejects.toMatchObject({ code: "CANDLE_TIME" });
   });
 
   it("reserves the documented worst-case 100 CU before a 4,800-candle page", async () => {
@@ -96,7 +249,7 @@ describe("BirdeyeSolUsdHistoryClient", () => {
 
   it("rejects impossible OHLC evidence and redacts request failures", async () => {
     const malformed = new BirdeyeSolUsdHistoryClient("managed-birdeye-key", {
-      maximumCandlesPerRequest: 2,
+      maximumCandlesPerRequest: 3,
       minimumRequestIntervalMs: 0,
       fetch: mockFetch(() => jsonResponse({
         success: true,
@@ -106,7 +259,7 @@ describe("BirdeyeSolUsdHistoryClient", () => {
     await expect(malformed.getSolUsdPrice(START)).rejects.toMatchObject({ code: "CANDLE_PRICE" });
 
     const failed = new BirdeyeSolUsdHistoryClient("managed-birdeye-key", {
-      maximumCandlesPerRequest: 2,
+      maximumCandlesPerRequest: 3,
       minimumRequestIntervalMs: 0,
       fetch: mockFetch(() => jsonResponse({ detail: "managed-birdeye-key" }, 401))
     });

@@ -60,6 +60,9 @@ const PARTIAL_RESEARCH_BATCH_LIMIT = 5;
 const PARTIAL_RESEARCH_PIPELINE_VERSION = "v5";
 const DEFAULT_HEAD_MAXIMUM_REPAIR_AGE_MS = 15 * 60_000;
 const DISCOVERY_ENQUEUE_CHUNK_SIZE = 50;
+const DEFAULT_REPRICE_BATCH_SIZE = 100;
+const REPRICE_YIELD_CHUNK_SIZE = 10;
+const DEFAULT_REPRICE_BATCH_COOLDOWN_MS = 1_000;
 // Admit one final cheap rescue tranche while keeping the acquisition
 // controller's 6,004-credit worst-case page reserve inviolate once it opens.
 export const MANAGED_DEEP_HISTORY_RESCUE_CREDIT_RESERVE = 6_100;
@@ -134,6 +137,10 @@ export interface WalletIndexWorkerOptions {
   identityFirstPoolResolver?: (mint: string, now: Date) => Promise<TokenEligibility>;
   /** Strict at-or-before local SOL/USD resolver used for historical SOL legs. */
   solPriceUsdResolver?: (at: string) => Promise<number>;
+  /** Bounded local-only reprices completed before coalesced wallet rebuilding. */
+  repriceBatchSize?: number;
+  /** Event-loop idle window after a durable reprice batch. Set to zero only in tests. */
+  repriceBatchCooldownMs?: number;
   programIds?: ReadonlySet<string>;
   rpc?: HeliusIndexRpc;
   now?: () => Date;
@@ -226,6 +233,8 @@ export class WalletIndexWorker {
   private readonly allowUnpricedStructuralCompletion: boolean;
   private readonly runManagedRecoveryPreflight: (() => Promise<boolean>) | undefined;
   private readonly solPriceUsdResolver: ((at: string) => Promise<number>) | undefined;
+  private readonly repriceBatchSize: number;
+  private readonly repriceBatchCooldownMs: number;
   private readonly workerId = `wallet-index-${randomUUID()}`;
   private stopped = false;
   private loopPromise: Promise<void> | undefined;
@@ -290,6 +299,15 @@ export class WalletIndexWorker {
     this.allowUnpricedStructuralCompletion = allowUnpricedStructuralCompletion;
     this.runManagedRecoveryPreflight = options.runManagedRecoveryPreflight;
     this.solPriceUsdResolver = options.solPriceUsdResolver;
+    this.repriceBatchSize = Math.max(
+      1,
+      Math.min(DEFAULT_REPRICE_BATCH_SIZE, Math.trunc(options.repriceBatchSize ?? DEFAULT_REPRICE_BATCH_SIZE))
+    );
+    const repriceBatchCooldownMs = options.repriceBatchCooldownMs ?? DEFAULT_REPRICE_BATCH_COOLDOWN_MS;
+    if (!Number.isSafeInteger(repriceBatchCooldownMs) || repriceBatchCooldownMs < 0 || repriceBatchCooldownMs > 60_000) {
+      throw new RangeError("repriceBatchCooldownMs must be an integer between 0 and 60000 milliseconds");
+    }
+    this.repriceBatchCooldownMs = repriceBatchCooldownMs;
     this.blockHydrationEnabled = this.repository.getSetting<boolean>("helius_index_block_supported") !== false;
     const client = options.rpc ?? new HeliusRpcClient(heliusApiKey, {
       requestsPerSecond: options.requestsPerSecond ?? 8,
@@ -474,9 +492,13 @@ export class WalletIndexWorker {
     // SELF_HOSTED ranking requires complete at-or-before prices, so preserve
     // its price-first behavior. MANAGED gets PnL from providers and deliberately
     // leaves the large local SOL reprice queue behind the full scoring funnel.
-    if (!this.allowUnpricedStructuralCompletion && await this.repriceOne()) return true;
+    if (!this.allowUnpricedStructuralCompletion && await this.repriceBatch()) return true;
     if (this.repository.listDirtyWalletIndexRecords(1).length > 0) {
-      this.updateRun({ stage: "HYDRATION" });
+      // A reprice batch deliberately leaves one durable dirty marker per
+      // affected wallet. Rebuilding that aggregate is maintenance of an
+      // already COMPLETE run, not a new index-run transition. Keeping COMPLETE
+      // here prevents one duplicate completion audit per priced swap.
+      if ((this.run ?? run).stage !== "COMPLETE") this.updateRun({ stage: "HYDRATION" });
       await this.materializeDirtyWallets();
       this.events?.publish("wallet-index", this.repository.walletIndexCoverage(this.now()));
       return true;
@@ -547,7 +569,7 @@ export class WalletIndexWorker {
         // A screened 100-wallet cohort is not the acquisition boundary. Keep
         // the persisted target fenced until its entire frozen generation is
         // certified MANAGED_SCREENED (or exactly COMPLETE).
-        if (await this.repriceOne()) return true;
+        if (await this.repriceBatch()) return true;
         return false;
       }
       const finalCoverage = this.repository.walletIndexCoverage(this.now());
@@ -560,7 +582,7 @@ export class WalletIndexWorker {
       }
       // No managed acquisition/scoring seam is runnable. Only now may local
       // price evidence consume a worker turn.
-      if (await this.repriceOne()) return true;
+      if (await this.repriceBatch()) return true;
       return false;
     }
 
@@ -631,6 +653,16 @@ export class WalletIndexWorker {
           .filter((handoff) => partialPrefixes.some((prefix) => handoff.generation.startsWith(prefix)))
           .flatMap((handoff) => handoff.wallets)
       );
+      // Frozen qualifying evidence must not leave the local boundary while its
+      // mutable wallet aggregate or source swaps await deterministic pricing.
+      // Defer the entire exact cohort so an empty/subset handoff cannot make a
+      // temporarily excluded qualifying wallet permanently unscannable.
+      if (evidence.some(({ record }) =>
+        record?.preScreenEligible && record.deepHistoryStatus === "COMPLETE" &&
+        record.structuralEligible && !alreadyHanded.has(record.wallet) &&
+        (!this.allowUnpricedStructuralCompletion || !completedProviderWallets?.has(record.wallet)) &&
+        this.repository.hasPendingWalletIndexMaintenance(record.wallet)
+      )) continue;
       if (this.identityEvidenceEnabled) {
         const unresolvedStructuralIdentity = evidence.some(({ record }) => {
           return record?.preScreenEligible && record.deepHistoryStatus === "COMPLETE" &&
@@ -744,6 +776,7 @@ export class WalletIndexWorker {
           record.preScreenEligible &&
           record.deepHistoryStatus === "COMPLETE" &&
           record.structuralEligible &&
+          !this.repository.hasPendingWalletIndexMaintenance(record.wallet) &&
           !alreadyHanded.has(record.wallet) &&
           (!this.allowUnpricedStructuralCompletion ||
             !completedProviderWallets?.has(record.wallet))
@@ -1811,6 +1844,12 @@ export class WalletIndexWorker {
       // a multi-wallet batch.
       await new Promise<void>((resolve) => setImmediate(resolve));
     }
+    if (materialized > 0) {
+      // Dirty/reprice state is intentionally outside the immutable evidence
+      // revision. Force one bounded rescan after a coalesced rebuild so a
+      // previously deferred cohort can become eligible without busy-polling.
+      this.lastResearchHandoffScanRevision = undefined;
+    }
     return materialized;
   }
 
@@ -1894,9 +1933,37 @@ export class WalletIndexWorker {
     };
   }
 
-  private async repriceOne(): Promise<boolean> {
+  private async repriceBatch(): Promise<boolean> {
+    let completed = 0;
+    for (let attempt = 0; attempt < this.repriceBatchSize; attempt += 1) {
+      const outcome = await this.repriceOne();
+      if (outcome === "NONE") break;
+      if (outcome === "COMPLETED") completed += 1;
+      if ((attempt + 1) % REPRICE_YIELD_CHUNK_SIZE === 0) {
+        // Local SQLite and already-resolved oracle promises can otherwise form
+        // a long microtask chain. A macrotask yield keeps provider body reads,
+        // loopback controls, and timeout accounting responsive.
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+    }
+    if (completed > 0) {
+      // The next worker turn will see the coalesced dirty-wallet set before
+      // another handoff can be frozen.
+      this.lastResearchHandoffScanRevision = undefined;
+      if (this.repriceBatchCooldownMs > 0) {
+        // A macrotask yield alone does not reduce CPU pressure while tens of
+        // thousands of local reprices remain. Leave a bounded idle window
+        // after every durable batch so network bodies and timeout callbacks can
+        // make progress before wallet materialization or the next batch.
+        await this.sleep(this.repriceBatchCooldownMs);
+      }
+    }
+    return completed > 0;
+  }
+
+  private async repriceOne(): Promise<"NONE" | "COMPLETED" | "RETRY_SCHEDULED"> {
     const pending = this.repository.nextPendingIndexedSwapReprice(this.now());
-    if (!pending) return false;
+    if (!pending) return "NONE";
     if (!this.solPriceUsdResolver) {
       this.repository.retryIndexedSwapReprice(
         pending.swap.id,
@@ -1904,7 +1971,7 @@ export class WalletIndexWorker {
         5 * 60_000,
         this.now()
       );
-      return false;
+      return "RETRY_SCHEDULED";
     }
     try {
       const solPriceUsd = await this.solPriceUsdResolver(pending.swap.blockTime);
@@ -1922,11 +1989,11 @@ export class WalletIndexWorker {
         throw new Error("Historical SOL swap reprice lost its pending ledger row.");
       }
       this.events?.publish("wallet-index-reprice", { swapId: pending.swap.id, blockTime: pending.swap.blockTime });
-      return true;
+      return "COMPLETED";
     } catch (error) {
       const delayMs = Math.min(6 * 60 * 60_000, 30_000 * 2 ** Math.min(10, pending.attempts - 1));
       this.repository.retryIndexedSwapReprice(pending.swap.id, errorText(error), delayMs, this.now());
-      return false;
+      return "RETRY_SCHEDULED";
     }
   }
 

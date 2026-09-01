@@ -400,6 +400,312 @@ describe("StockPaperEngine", () => {
     }, "OVERNIGHT")).toBe(false);
   });
 
+  it("coalesces concurrent cycle triggers and recovers once from an asset-endpoint failure", async () => {
+    db = openDatabase(":memory:");
+    const repository = new StockPaperRepository(db);
+    let now = new Date("2026-07-16T15:00:00.000Z");
+    let clockCalls = 0;
+    let assetCalls = 0;
+    let firstAssetsStartedResolve!: () => void;
+    let secondAssetsStartedResolve!: () => void;
+    let rejectFirstAssets!: (reason?: unknown) => void;
+    let resolveSecondAssets!: (assets: AlpacaStockAsset[]) => void;
+    const firstAssetsStarted = new Promise<void>((resolve) => {
+      firstAssetsStartedResolve = resolve;
+    });
+    const secondAssetsStarted = new Promise<void>((resolve) => {
+      secondAssetsStartedResolve = resolve;
+    });
+    const provider = {
+      async getClock(): Promise<AlpacaMarketClock> {
+        clockCalls += 1;
+        return {
+          timestamp: now.toISOString(),
+          isOpen: true,
+          nextOpen: "2026-07-17T13:30:00.000Z",
+          nextClose: "2026-07-16T20:00:00.000Z"
+        };
+      },
+      async getAssets(): Promise<AlpacaStockAsset[]> {
+        assetCalls += 1;
+        if (assetCalls === 1) {
+          firstAssetsStartedResolve();
+          return new Promise<AlpacaStockAsset[]>((_resolve, reject) => {
+            rejectFirstAssets = reject;
+          });
+        }
+        secondAssetsStartedResolve();
+        return new Promise<AlpacaStockAsset[]>((resolve) => {
+          resolveSecondAssets = resolve;
+        });
+      },
+      async getSnapshots(): Promise<AlpacaStockSnapshot[]> {
+        return [];
+      },
+      async getBars(input: { symbols: readonly string[] }): Promise<AlpacaBarsResult> {
+        return { bars: new Map(input.symbols.map((symbol) => [symbol, []])) };
+      }
+    } as unknown as AlpacaPaperProvider;
+    const errors: unknown[] = [];
+    const engine = new StockPaperEngine(repository, {
+      mode: () => "PAPER",
+      credentials: () => ({ apiKey: "paper-api-key", secretKey: "paper-secret-key" }),
+      provider: () => provider,
+      now: () => now,
+      onError: (error) => {
+        errors.push(error);
+        if (errors.length === 1) now = new Date("2026-07-16T15:05:00.000Z");
+      }
+    });
+
+    const first = engine.enqueueCycle();
+    await firstAssetsStarted;
+    const pending = engine.enqueueCycle();
+    const coalesced = engine.enqueueCycle();
+    expect(coalesced).toBe(pending);
+    expect(clockCalls).toBe(1);
+    expect(assetCalls).toBe(1);
+
+    rejectFirstAssets(new Error("asset universe unavailable"));
+    await expect(first).rejects.toThrow("Alpaca Assets inventory is unavailable");
+    await secondAssetsStarted;
+
+    const blocked = repository.dashboard();
+    expect(blocked.market).toMatchObject({
+      feedActionable: false,
+      readiness: { status: "BLOCKED" }
+    });
+    expect(blocked.market.readiness?.reasons).toEqual([
+      expect.stringContaining("REQUIRED_ENDPOINT_FAILED")
+    ]);
+    expect(blocked.positions).toEqual([]);
+    expect(blocked.recentSignals).toEqual([]);
+    expect(blocked.recentTrades).toEqual([]);
+    expect(blocked.orders).toEqual([]);
+    expect(blocked.equityCurve).toEqual([]);
+    expect(errors).toHaveLength(1);
+
+    resolveSecondAssets([]);
+    await Promise.all([pending, coalesced]);
+    await engine.drain();
+
+    const recovered = repository.dashboard();
+    expect(clockCalls).toBe(2);
+    expect(assetCalls).toBe(2);
+    expect(recovered.market.lastError).toBeUndefined();
+    expect(recovered.positions).toEqual([]);
+    expect(recovered.recentSignals).toEqual([]);
+    expect(recovered.recentTrades).toEqual([]);
+    expect(recovered.orders).toEqual([]);
+    expect(recovered.equityCurve).toHaveLength(1);
+    expect(errors).toHaveLength(1);
+  });
+
+  it("blocks no-cache asset retries for four minutes and retries exactly at five minutes", async () => {
+    db = openDatabase(":memory:");
+    const repository = new StockPaperRepository(db);
+    const startedAt = Date.parse("2026-07-16T15:00:00.000Z");
+    let now = new Date(startedAt);
+    let assetCalls = 0;
+    let snapshotCalls = 0;
+    let assetsAvailable = false;
+    const provider = {
+      async getClock(): Promise<AlpacaMarketClock> {
+        return {
+          timestamp: now.toISOString(),
+          isOpen: true,
+          nextOpen: "2026-07-17T13:30:00.000Z",
+          nextClose: "2026-07-16T20:00:00.000Z"
+        };
+      },
+      async getAssets(): Promise<AlpacaStockAsset[]> {
+        assetCalls += 1;
+        if (!assetsAvailable) throw new Error("asset endpoint failed");
+        return [];
+      },
+      async getSnapshots(): Promise<AlpacaStockSnapshot[]> {
+        snapshotCalls += 1;
+        return [];
+      },
+      async getBars(input: { symbols: readonly string[] }): Promise<AlpacaBarsResult> {
+        return { bars: new Map(input.symbols.map((symbol) => [symbol, []])) };
+      }
+    } as unknown as AlpacaPaperProvider;
+    const engine = new StockPaperEngine(repository, {
+      mode: () => "PAPER",
+      credentials: () => ({ apiKey: "paper-api-key", secretKey: "paper-secret-key" }),
+      provider: () => provider,
+      now: () => now
+    });
+
+    await expect(engine.enqueueCycle()).rejects.toThrow(
+      "Alpaca Assets inventory is unavailable"
+    );
+    expect(assetCalls).toBe(1);
+    for (let minute = 1; minute <= 4; minute += 1) {
+      now = new Date(startedAt + minute * 60_000);
+      await expect(engine.enqueueCycle()).rejects.toThrow(
+        "Alpaca Assets inventory is unavailable"
+      );
+      expect(assetCalls).toBe(1);
+      const blocked = repository.dashboard();
+      expect(blocked.market.readiness?.status).toBe("BLOCKED");
+      expect(blocked.positions).toEqual([]);
+      expect(blocked.recentSignals).toEqual([]);
+      expect(blocked.recentTrades).toEqual([]);
+      expect(blocked.orders).toEqual([]);
+      expect(blocked.equityCurve).toEqual([]);
+    }
+    expect(snapshotCalls).toBe(0);
+
+    assetsAvailable = true;
+    now = new Date(startedAt + 5 * 60_000);
+    await expect(engine.enqueueCycle()).resolves.toBeUndefined();
+    await engine.drain();
+    const recovered = repository.dashboard();
+    expect(assetCalls).toBe(2);
+    expect(snapshotCalls).toBe(1);
+    expect(recovered.market.lastError).toBeUndefined();
+    expect(recovered.positions).toEqual([]);
+    expect(recovered.recentSignals).toEqual([]);
+    expect(recovered.recentTrades).toEqual([]);
+    expect(recovered.orders).toEqual([]);
+    expect(recovered.equityCurve).toHaveLength(1);
+  });
+
+  it("uses only the same overnight cache during cooldown and clears it after a successful retry", async () => {
+    db = openDatabase(":memory:");
+    const repository = new StockPaperRepository(db);
+    const startedAt = Date.parse("2026-07-17T01:00:00.000Z");
+    let now = new Date(startedAt);
+    let assetCalls = 0;
+    const provider = {
+      async getClock(): Promise<AlpacaMarketClock> {
+        return {
+          timestamp: now.toISOString(),
+          isOpen: false,
+          nextOpen: "2026-07-17T13:30:00.000Z",
+          nextClose: "2026-07-17T20:00:00.000Z"
+        };
+      },
+      async getAssets(): Promise<AlpacaStockAsset[]> {
+        assetCalls += 1;
+        if (assetCalls === 2) throw new Error("overnight asset refresh failed");
+        return [testAsset()];
+      },
+      async getSnapshots(): Promise<AlpacaStockSnapshot[]> {
+        return [];
+      },
+      async getBars(input: { symbols: readonly string[] }): Promise<AlpacaBarsResult> {
+        return { bars: new Map(input.symbols.map((symbol) => [symbol, []])) };
+      }
+    } as unknown as AlpacaPaperProvider;
+    const engine = new StockPaperEngine(repository, {
+      mode: () => "PAPER",
+      credentials: () => ({ apiKey: "paper-api-key", secretKey: "paper-secret-key" }),
+      provider: () => provider,
+      now: () => now
+    });
+
+    await engine.enqueueCycle();
+    expect(assetCalls).toBe(1);
+
+    now = new Date(startedAt + 10 * 60_000);
+    await expect(engine.enqueueCycle()).resolves.toBeUndefined();
+    expect(assetCalls).toBe(2);
+    expect(repository.dashboard().market.readiness?.reasons).toEqual(
+      expect.arrayContaining([expect.stringContaining("OPTIONAL_ENDPOINT_FAILED")])
+    );
+
+    for (let minute = 11; minute <= 14; minute += 1) {
+      now = new Date(startedAt + minute * 60_000);
+      await expect(engine.enqueueCycle()).resolves.toBeUndefined();
+      expect(assetCalls).toBe(2);
+      expect(repository.dashboard().market.readiness?.reasons).toEqual(
+        expect.arrayContaining([expect.stringContaining("OPTIONAL_ENDPOINT_FAILED")])
+      );
+    }
+
+    now = new Date(startedAt + 15 * 60_000);
+    await expect(engine.enqueueCycle()).resolves.toBeUndefined();
+    expect(assetCalls).toBe(3);
+    expect(repository.dashboard().market.readiness?.reasons ?? []).not.toEqual(
+      expect.arrayContaining([expect.stringContaining("OPTIONAL_ENDPOINT_FAILED")])
+    );
+
+    now = new Date(startedAt + 25 * 60_000);
+    await expect(engine.enqueueCycle()).resolves.toBeUndefined();
+    await engine.drain();
+    expect(assetCalls).toBe(4);
+    const dashboard = repository.dashboard();
+    expect(dashboard.positions).toEqual([]);
+    expect(dashboard.recentSignals).toEqual([]);
+    expect(dashboard.recentTrades).toEqual([]);
+    expect(dashboard.orders).toEqual([]);
+  });
+
+  it("never borrows an IEX asset cache for an overnight key", async () => {
+    db = openDatabase(":memory:");
+    const repository = new StockPaperRepository(db);
+    let now = new Date("2026-07-16T15:00:00.000Z");
+    let assetCalls = 0;
+    let snapshotCalls = 0;
+    const provider = {
+      async getClock(): Promise<AlpacaMarketClock> {
+        return {
+          timestamp: now.toISOString(),
+          isOpen: now.getUTCHours() === 15,
+          nextOpen: "2026-07-17T13:30:00.000Z",
+          nextClose: "2026-07-17T20:00:00.000Z"
+        };
+      },
+      async getAssets(): Promise<AlpacaStockAsset[]> {
+        assetCalls += 1;
+        if (assetCalls >= 2) throw new Error("overnight inventory unavailable");
+        return [testAsset()];
+      },
+      async getSnapshots(): Promise<AlpacaStockSnapshot[]> {
+        snapshotCalls += 1;
+        return [];
+      },
+      async getBars(input: { symbols: readonly string[] }): Promise<AlpacaBarsResult> {
+        return { bars: new Map(input.symbols.map((symbol) => [symbol, []])) };
+      }
+    } as unknown as AlpacaPaperProvider;
+    const engine = new StockPaperEngine(repository, {
+      mode: () => "PAPER",
+      credentials: () => ({ apiKey: "paper-api-key", secretKey: "paper-secret-key" }),
+      provider: () => provider,
+      now: () => now
+    });
+
+    await engine.enqueueCycle();
+    expect(assetCalls).toBe(1);
+    expect(snapshotCalls).toBe(1);
+    expect(repository.dashboard().equityCurve).toHaveLength(1);
+
+    now = new Date("2026-07-17T01:00:00.000Z");
+    await expect(engine.enqueueCycle()).rejects.toThrow(
+      "Alpaca Assets inventory is unavailable"
+    );
+    expect(assetCalls).toBe(2);
+    expect(snapshotCalls).toBe(1);
+
+    now = new Date("2026-07-17T01:01:00.000Z");
+    await expect(engine.enqueueCycle()).rejects.toThrow(
+      "Alpaca Assets inventory is unavailable"
+    );
+    expect(assetCalls).toBe(2);
+    expect(snapshotCalls).toBe(1);
+    const blocked = repository.dashboard();
+    expect(blocked.market.readiness?.status).toBe("BLOCKED");
+    expect(blocked.equityCurve).toHaveLength(1);
+    expect(blocked.positions).toEqual([]);
+    expect(blocked.recentSignals).toEqual([]);
+    expect(blocked.recentTrades).toEqual([]);
+    expect(blocked.orders).toEqual([]);
+  });
+
   it("fetches actual due observation symbols before labeling rotated-out evidence", async () => {
     db = openDatabase(":memory:");
     const repository = new StockPaperRepository(db);

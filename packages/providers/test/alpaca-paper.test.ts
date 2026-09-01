@@ -4,6 +4,7 @@ import {
   ALPACA_PAPER_TRADING_ORIGIN,
   AlpacaPaperProvider
 } from "../src/alpaca-paper.js";
+import { ProviderApiError } from "../src/http.js";
 import { jsonResponse, mockFetch } from "./helpers.js";
 
 describe("AlpacaPaperProvider", () => {
@@ -56,6 +57,33 @@ describe("AlpacaPaperProvider", () => {
     expect(JSON.stringify(status)).not.toContain("exposed-api-key");
     expect(JSON.stringify(status)).not.toContain("exposed-secret-key");
     expect(JSON.stringify(status)).not.toContain("sensitive-response");
+  });
+
+  it.each([
+    { endpoint: "clock", path: "/v2/clock", providerLabel: "Alpaca Market Clock" },
+    { endpoint: "assets", path: "/v2/assets", providerLabel: "Alpaca Assets" }
+  ])("attributes $endpoint request failures to its distinct provider label", async ({
+    endpoint,
+    path,
+    providerLabel
+  }) => {
+    let requestedPath: string | undefined;
+    const provider = new AlpacaPaperProvider(
+      { apiKey: "paper-api-key", secretKey: "paper-secret-key" },
+      {
+        fetch: mockFetch((url) => {
+          requestedPath = url.pathname;
+          return jsonResponse({ message: "temporary upstream outage" }, 503);
+        })
+      }
+    );
+
+    const error = await (endpoint === "clock" ? provider.getClock() : provider.getAssets())
+      .catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(ProviderApiError);
+    expect(error).toMatchObject({ provider: providerLabel, status: 503, retryable: true });
+    expect(String(error)).toContain(`${providerLabel}:`);
+    expect(requestedPath).toBe(path);
   });
 
   it("rejects multiline or malformed credentials before network I/O", () => {

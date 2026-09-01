@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
+import { BIRDEYE_SOL_USD_HISTORY_PREVIOUS_5M_SOURCE } from "@copylab/providers";
 import { openDatabase, type CopyLabDatabase } from "../src/database.js";
 import { LocalSolPriceOracle } from "../src/local-sol-price.js";
 import { Repository } from "../src/repository.js";
@@ -34,6 +35,82 @@ describe("LocalSolPriceOracle", () => {
     expect(oracle.coverage()).toMatchObject({ largestGapSeconds: expect.closeTo(1_500, 3) });
   });
 
+  it("orders prices by their effective observation rather than the fallback grid timestamp", () => {
+    db = openDatabase(":memory:");
+    const repository = new Repository(db);
+    const oracle = new LocalSolPriceOracle(repository);
+    repository.saveSolPriceSnapshot({
+      capturedAt: "2026-07-10T12:00:00.000Z",
+      observedAt: "2026-07-10T11:55:00.000Z",
+      priceUsd: 150,
+      source: BIRDEYE_SOL_USD_HISTORY_PREVIOUS_5M_SOURCE
+    });
+    oracle.record(151, "2026-07-10T11:58:00.000Z", "fixture");
+
+    expect(oracle.resolve("2026-07-10T12:00:00.000Z")).toBe(151);
+  });
+
+  it("expires previous-five-minute evidence ten minutes after its real observation", () => {
+    db = openDatabase(":memory:");
+    const repository = new Repository(db);
+    const oracle = new LocalSolPriceOracle(repository);
+    repository.saveSolPriceSnapshot({
+      capturedAt: "2026-07-10T12:00:00.000Z",
+      observedAt: "2026-07-10T11:55:00.000Z",
+      priceUsd: 150,
+      source: BIRDEYE_SOL_USD_HISTORY_PREVIOUS_5M_SOURCE
+    });
+
+    expect(oracle.resolve("2026-07-10T12:05:00.000Z")).toBe(150);
+    expect(() => oracle.resolve("2026-07-10T12:05:00.001Z")).toThrow("No at-or-before");
+    expect(() => oracle.resolve("2026-07-10T11:54:59.999Z")).toThrow("No at-or-before");
+  });
+
+  it("measures coverage gaps from the fallback's real observation time", () => {
+    db = openDatabase(":memory:");
+    const repository = new Repository(db);
+    const oracle = new LocalSolPriceOracle(repository);
+    oracle.record(149, "2026-07-10T11:50:00.000Z", "fixture");
+    repository.saveSolPriceSnapshot({
+      capturedAt: "2026-07-10T12:00:00.000Z",
+      observedAt: "2026-07-10T11:55:00.000Z",
+      priceUsd: 150,
+      source: BIRDEYE_SOL_USD_HISTORY_PREVIOUS_5M_SOURCE
+    });
+    oracle.record(151, "2026-07-10T12:10:00.000Z", "fixture");
+
+    expect(oracle.coverage()).toMatchObject({
+      count: 3,
+      oldestAt: "2026-07-10T11:50:00.000Z",
+      newestAt: "2026-07-10T12:10:00.000Z",
+      largestGapSeconds: expect.closeTo(900, 3)
+    });
+  });
+
+  it("reduces a truthful fallback gap from 900 to 600 seconds with a real following candle", () => {
+    db = openDatabase(":memory:");
+    const repository = new Repository(db);
+    const oracle = new LocalSolPriceOracle(repository);
+    oracle.record(149, "2026-07-10T11:50:00.000Z", "fixture");
+    repository.saveSolPriceSnapshot({
+      capturedAt: "2026-07-10T12:00:00.000Z",
+      observedAt: "2026-07-10T11:55:00.000Z",
+      priceUsd: 150,
+      source: BIRDEYE_SOL_USD_HISTORY_PREVIOUS_5M_SOURCE
+    });
+    repository.saveSolPriceSnapshot({
+      capturedAt: "2026-07-10T12:05:00.000Z",
+      observedAt: "2026-07-10T12:05:00.000Z",
+      priceUsd: 150.5,
+      source: "birdeye_ohlcv_v3"
+    });
+    oracle.record(151, "2026-07-10T12:10:00.000Z", "fixture");
+
+    expect(() => oracle.resolve("2026-07-10T12:04:59.999Z")).not.toThrow();
+    expect(oracle.resolve("2026-07-10T12:04:59.999Z")).toBe(150);
+    expect(oracle.coverage()).toMatchObject({ count: 4, largestGapSeconds: expect.closeTo(600, 3) });
+  });
+
   it("uses a covering swap index for pending reprice coverage", () => {
     db = openDatabase(":memory:");
     const index = db.prepare(`
@@ -58,7 +135,8 @@ describe("LocalSolPriceOracle", () => {
 
   it("fails closed outside the configured historical tolerance", () => {
     db = openDatabase(":memory:");
-    const oracle = new LocalSolPriceOracle(new Repository(db), 60_000);
+    const repository = new Repository(db);
+    const oracle = new LocalSolPriceOracle(repository, 60_000);
     oracle.record(150, "2026-07-10T12:00:00.000Z", "fixture");
     expect(() => oracle.resolve("2026-07-10T12:02:00.000Z")).toThrow("No at-or-before");
     expect(() => oracle.resolve("2026-07-10T11:59:59.000Z")).toThrow("No at-or-before");
@@ -66,5 +144,19 @@ describe("LocalSolPriceOracle", () => {
     expect(() => oracle.record(151, "2026-07-10T12:00:00.000Z", "other-source")).toThrow(
       "cannot be overwritten"
     );
+    expect(() => repository.saveSolPriceSnapshot({
+      capturedAt: "2026-07-10T12:00:00.000Z",
+      observedAt: "2026-07-10T11:59:00.000Z",
+      priceUsd: 150,
+      source: "fixture"
+    })).toThrow("cannot be overwritten");
+    repository.saveSolPriceSnapshot({
+      capturedAt: "2026-07-10T12:05:00.000Z",
+      observedAt: "2026-07-10T12:05:00.001Z",
+      priceUsd: 150,
+      source: "fixture"
+    });
+    expect(() => oracle.resolve("2026-07-10T12:05:00.000Z")).toThrow("No at-or-before");
+    expect(oracle.resolve("2026-07-10T12:05:00.001Z")).toBe(150);
   });
 });

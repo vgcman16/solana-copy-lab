@@ -259,13 +259,14 @@ function withExitQuoteFailure(
   const openedAt = Date.parse(position.openedAt);
   const agedTerminalVerification = code === "JUPITER_EXIT_NO_ROUTE" &&
     consecutiveNoRoutes !== undefined &&
-    consecutiveNoRoutes < RESEARCH_TERMINAL_WRITE_OFF_MINIMUM_NO_ROUTE_FAILURES &&
     Number.isFinite(openedAt) &&
     at.getTime() - openedAt >= RESEARCH_TERMINAL_WRITE_OFF_MINIMUM_AGE_MS;
   // Once an already-zero PAPER lot is old enough for terminal verification,
   // collect honest observations at most once per normal five-minute mark. The
-  // separate streak still has to reach the terminal threshold; no burst or
-  // historical outage count can accelerate it.
+  // separate streak still has to reach the terminal threshold, and bounded
+  // probes continue after that threshold until fresh token evidence authorizes
+  // a write-off or an executable quote recovers. No burst or historical outage
+  // count can accelerate it.
   const delayMs = agedTerminalVerification
     ? RESEARCH_AGED_TERMINAL_PROBE_RETRY_MS
     : Math.min(maximumDelayMs, RESEARCH_EXIT_QUOTE_RETRY_BASE_MS * 2 ** exponent);

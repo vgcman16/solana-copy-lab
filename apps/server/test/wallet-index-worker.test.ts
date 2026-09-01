@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { USDC_MINT, type WalletIndexRecord } from "@copylab/shared";
+import { SOL_MINT, USDC_MINT, type IndexedSpotSwap, type WalletIndexRecord } from "@copylab/shared";
 import type {
   HeliusIndexRpc,
   HeliusSignatureInfo,
@@ -354,6 +354,57 @@ function persistCoarseSourceTransaction(
 
 function confirmedSwapForWallet(wallet: string): unknown {
   return JSON.parse(JSON.stringify(confirmedSwap()).replaceAll(WALLET, wallet)) as unknown;
+}
+
+function persistUnpricedSolSwaps(
+  repository: Repository,
+  count: number,
+  wallet = WALLET
+): IndexedSpotSwap[] {
+  const signature = `sol-reprice-batch-${wallet}-${count}`;
+  const blockTime = new Date(NOW.getTime() - 60_000).toISOString();
+  const swaps = Array.from({ length: count }, (_, index): IndexedSpotSwap => ({
+    id: `${signature}:${index}`,
+    signature,
+    wallet,
+    swapIndex: index,
+    slot: 50,
+    blockTime,
+    side: "BUY",
+    baseMint: SOL_MINT,
+    targetMint: TARGET,
+    inputMint: SOL_MINT,
+    outputMint: TARGET,
+    inputAmountAtomic: "1000000000",
+    outputAmountAtomic: "10000000",
+    inputAmountUi: 1,
+    outputAmountUi: 10,
+    eligible: true,
+    eligibilityReasons: [],
+    programIds: [PROGRAM],
+    indexedAt: blockTime
+  }));
+  repository.enqueueWalletIndexTransactions([{
+    signature,
+    sourceAddress: PROGRAM,
+    wallet,
+    source: "reprice-batch-test",
+    discoveredAt: blockTime,
+    slot: 50,
+    blockTime,
+    metadata: { failed: false }
+  }]);
+  const leased = repository.leaseWalletIndexTransactions("reprice-batch-test", 1, 60, NOW)[0];
+  if (!leased?.leaseToken) throw new Error("Expected the SOL reprice fixture to lease its source transaction");
+  if (!repository.completeWalletIndexTransaction({
+    ...leased,
+    success: true,
+    sourceWallets: [wallet],
+    updatedAt: NOW.toISOString()
+  }, swaps, leased.leaseToken, NOW)) {
+    throw new Error("Expected the SOL reprice fixture transaction to complete");
+  }
+  return swaps;
 }
 
 describe("WalletIndexWorker", () => {
@@ -1351,6 +1402,234 @@ describe("WalletIndexWorker", () => {
       indexedSwaps: 100,
       indexedWallets: 1,
       queueByStatus: { PROCESSED: 100, PENDING: 0, LEASED: 0, RETRY: 0, FAILED: 0 }
+    });
+  });
+
+  it("completes 100 reprices before one coalesced wallet rebuild and yields to macrotasks", async () => {
+    db = openDatabase(":memory:");
+    const repository = new Repository(db);
+    const seededRecord = pendingWalletRecord(WALLET);
+    repository.upsertWalletIndexRecord(seededRecord);
+    repository.saveWalletPreScreenSnapshot({
+      wallet: WALLET,
+      runId: "reprice-batch-prescreen",
+      calculatedAt: NOW.toISOString(),
+      eligible: false,
+      reasons: seededRecord.preScreenReasons,
+      record: seededRecord
+    });
+    persistUnpricedSolSwaps(repository, 100);
+    const materializeReads = vi.spyOn(repository, "listIndexedSpotSwaps");
+    const cooldown = vi.fn(async (_milliseconds: number) => {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    });
+    let priceReads = 0;
+    const worker = new WalletIndexWorker(repository, "unused-in-test", undefined, {
+      rpc: {
+        getSignaturesForAddress: async () => [],
+        getTransaction: async () => null
+      },
+      programIds: new Set([PROGRAM]),
+      targetWallets: 1,
+      deepHistoryEnabled: false,
+      deepHistoryAllowUnpricedStructuralCompletion: true,
+      onAcquisitionPipelineDrained: () => false,
+      programHeadMaintenanceEnabled: false,
+      solPriceUsdResolver: async () => { priceReads += 1; return 100; },
+      sleep: cooldown,
+      now: () => new Date(NOW)
+    });
+
+    expect(await worker.runOnce()).toBe(true); // repair the ingestion-time dirty marker
+    materializeReads.mockClear();
+    let batchFinished = false;
+    const macrotask = new Promise<void>((resolve) => setImmediate(resolve));
+    const batch = worker.runOnce().then((result) => {
+      batchFinished = true;
+      return result;
+    });
+    await macrotask;
+    expect(batchFinished).toBe(false);
+    expect(priceReads).toBeGreaterThan(0);
+    expect(priceReads).toBeLessThan(100);
+    expect(await batch).toBe(true);
+    expect(priceReads).toBe(100);
+    expect(cooldown).toHaveBeenCalledTimes(1);
+    expect(cooldown).toHaveBeenLastCalledWith(1_000);
+    expect(db.prepare(`
+      SELECT status, COUNT(*) AS count FROM indexed_swap_reprice_queue GROUP BY status
+    `).all()).toEqual([{ status: "COMPLETE", count: 100 }]);
+    expect(repository.listDirtyWalletIndexRecords(10)).toHaveLength(1);
+    expect(repository.hasPendingWalletIndexMaintenance(WALLET)).toBe(true);
+    expect(materializeReads).not.toHaveBeenCalled();
+
+    expect(await worker.runOnce()).toBe(true); // one rebuild for all 100 prices
+    expect(materializeReads).toHaveBeenCalledTimes(1);
+    expect(repository.listDirtyWalletIndexRecords(10)).toEqual([]);
+    expect(repository.hasPendingWalletIndexMaintenance(WALLET)).toBe(false);
+    expect(await worker.runOnce()).toBe(false); // settled COMPLETE run
+    expect(await worker.runOnce()).toBe(false); // no duplicate completion transition
+    expect(db.prepare(`
+      SELECT COUNT(*) AS count FROM audit_events WHERE event_type = 'wallet_index_complete'
+    `).get()).toEqual({ count: 1 });
+
+    const completedRuns = repository.listWalletIndexRuns(10);
+    expect(completedRuns).toHaveLength(1);
+    expect(completedRuns[0]?.stage).toBe("COMPLETE");
+    persistUnpricedSolSwaps(repository, 1);
+    expect(await worker.runOnce()).toBe(true); // repair new ingestion dirt without reopening COMPLETE
+    expect(await worker.runOnce()).toBe(true); // complete the new one-row reprice batch
+    expect(cooldown).toHaveBeenCalledTimes(2);
+    expect(cooldown).toHaveBeenLastCalledWith(1_000);
+    expect(await worker.runOnce()).toBe(true); // rebuild the wallet once for that batch
+    expect(await worker.runOnce()).toBe(false); // remain settled without another COMPLETE transition
+    expect(repository.listWalletIndexRuns(10)).toMatchObject([{
+      id: completedRuns[0]?.id,
+      stage: "COMPLETE"
+    }]);
+    expect(db.prepare(`
+      SELECT COUNT(*) AS count FROM audit_events WHERE event_type = 'wallet_index_complete'
+    `).get()).toEqual({ count: 1 });
+  });
+
+  it("retains a failed reprice as pending evidence without dirtying or rebuilding the wallet", async () => {
+    db = openDatabase(":memory:");
+    const repository = new Repository(db);
+    const seededRecord = pendingWalletRecord(WALLET);
+    repository.upsertWalletIndexRecord(seededRecord);
+    repository.saveWalletPreScreenSnapshot({
+      wallet: WALLET,
+      runId: "reprice-failure-prescreen",
+      calculatedAt: NOW.toISOString(),
+      eligible: false,
+      reasons: seededRecord.preScreenReasons,
+      record: seededRecord
+    });
+    persistUnpricedSolSwaps(repository, 1);
+    const materializeReads = vi.spyOn(repository, "listIndexedSpotSwaps");
+    const worker = new WalletIndexWorker(repository, "unused-in-test", undefined, {
+      rpc: {
+        getSignaturesForAddress: async () => [],
+        getTransaction: async () => null
+      },
+      programIds: new Set([PROGRAM]),
+      targetWallets: 1,
+      deepHistoryEnabled: false,
+      deepHistoryAllowUnpricedStructuralCompletion: true,
+      onAcquisitionPipelineDrained: () => false,
+      programHeadMaintenanceEnabled: false,
+      solPriceUsdResolver: async () => { throw new Error("price gap"); },
+      now: () => new Date(NOW)
+    });
+
+    expect(await worker.runOnce()).toBe(true); // repair the ingestion-time dirty marker
+    materializeReads.mockClear();
+    expect(await worker.runOnce()).toBe(false);
+    expect(db.prepare(`
+      SELECT status, attempts, last_error FROM indexed_swap_reprice_queue
+    `).get()).toEqual({ status: "PENDING", attempts: 1, last_error: "price gap" });
+    expect(repository.listDirtyWalletIndexRecords(10)).toEqual([]);
+    expect(repository.hasPendingWalletIndexMaintenance(WALLET)).toBe(true);
+    expect(materializeReads).not.toHaveBeenCalled();
+    expect(repository.listIndexedSpotSwaps(WALLET)[0]?.priceUsd).toBeUndefined();
+  });
+
+  it("defers an exact research handoff until pending and dirty wallet maintenance settles", async () => {
+    db = openDatabase(":memory:");
+    const repository = new Repository(db);
+    const wallet = "maintenance-deferred-wallet";
+    const cleanWallet = "maintenance-clean-peer";
+    const cohort = repository.createWalletDeepHistoryCohort({
+      selectedAt: NOW.toISOString(),
+      snapshotCutoffAt: NOW.toISOString(),
+      windowStart: new Date(NOW.getTime() - 90 * 86_400_000).toISOString(),
+      windowEnd: NOW.toISOString(),
+      wallets: [wallet, cleanWallet]
+    });
+    for (const candidateWallet of [wallet, cleanWallet]) {
+      const record: WalletIndexRecord = {
+        wallet: candidateWallet,
+        firstSeenAt: cohort.windowStart,
+        lastSeenAt: cohort.windowEnd,
+        historyDays: 90,
+        transactionCount: 100,
+        successfulTransactionCount: 100,
+        spotSwapCount: 100,
+        eligibleSpotSwapCount: 100,
+        closedEligibleSwaps: 50,
+        buyCount: 50,
+        sellCount: 50,
+        activeDays: 20,
+        activeWeeks: 4,
+        distinctMints: 10,
+        medianHoldingMinutes: 20,
+        preScreenEligible: true,
+        preScreenReasons: [],
+        deepHistoryStatus: "COMPLETE",
+        deepHistoryWindowStart: cohort.windowStart,
+        deepHistoryWindowEnd: cohort.windowEnd,
+        deepHistorySignatureCount: 100,
+        deepHistoryHydratedCount: 100,
+        structuralEligible: true,
+        structuralReasons: [],
+        updatedAt: NOW.toISOString()
+      };
+      repository.upsertWalletIndexRecord(record);
+      repository.saveWalletPreScreenSnapshot({
+        wallet: candidateWallet,
+        runId: `maintenance-handoff-prescreen-${candidateWallet}`,
+        calculatedAt: NOW.toISOString(),
+        eligible: true,
+        reasons: [],
+        record
+      });
+      repository.saveWalletDeepHistoryEvidence({
+        generationId: cohort.generationId,
+        cohortId: cohort.id,
+        wallet: candidateWallet,
+        record,
+        swaps: [],
+        frozenAt: NOW.toISOString()
+      });
+    }
+    expect(repository.completeWalletDeepHistoryCohort(cohort.id, NOW)).toBe(true);
+    expect(repository.completeWalletDeepHistoryGeneration(cohort.generationId, NOW)).toBe(true);
+    persistUnpricedSolSwaps(repository, 1, wallet);
+    const generation = `local-index-v4:${cohort.generationId}:${cohort.id}`;
+    const worker = new WalletIndexWorker(repository, "unused-in-test", undefined, {
+      rpc: {
+        getSignaturesForAddress: async () => [],
+        getTransaction: async () => null
+      },
+      programIds: new Set([PROGRAM]),
+      targetWallets: 1,
+      deepHistoryCanStartNextCohort: () => false,
+      deepHistoryAllowUnpricedStructuralCompletion: true,
+      onAcquisitionPipelineDrained: () => false,
+      programHeadMaintenanceEnabled: false,
+      solPriceUsdResolver: async () => 100,
+      repriceBatchCooldownMs: 0,
+      now: () => new Date(NOW)
+    });
+
+    expect(repository.listWalletIndexResearchShortlist().map((entry) => entry.wallet)).toEqual([cleanWallet]);
+    expect(await worker.runOnce()).toBe(true); // clear ingestion-time dirty marker; price still pending
+    expect(repository.getWalletResearchHandoff(generation)).toBeUndefined();
+    expect(repository.listWalletIndexResearchShortlist().map((entry) => entry.wallet)).toEqual([cleanWallet]);
+    expect(await worker.runOnce()).toBe(true); // complete reprice; coalesced dirty marker remains
+    expect(repository.getWalletResearchHandoff(generation)).toBeUndefined();
+    expect(repository.listWalletIndexResearchShortlist().map((entry) => entry.wallet)).toEqual([cleanWallet]);
+    expect(await worker.runOnce()).toBe(true); // rebuild the wallet once
+    expect(repository.getWalletResearchHandoff(generation)).toBeUndefined();
+    expect(repository.hasPendingWalletIndexMaintenance(wallet)).toBe(false);
+    expect(repository.listWalletIndexResearchShortlist().map((entry) => entry.wallet)).toEqual([
+      cleanWallet,
+      wallet
+    ]);
+    expect(await worker.runOnce()).toBe(true); // the invalidated scan now hands off exact evidence
+    expect(repository.getWalletResearchHandoff(generation)).toMatchObject({
+      status: "READY",
+      wallets: [cleanWallet, wallet]
     });
   });
 

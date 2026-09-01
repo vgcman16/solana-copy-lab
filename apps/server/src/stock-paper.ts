@@ -92,6 +92,7 @@ import { buildCompletedStockPaperTradePath } from "./stock-paper-trade-path.js";
 
 const CLOSED_SCAN_INTERVAL_MS = 5 * 60_000;
 const OVERNIGHT_ASSET_REFRESH_MS = 10 * 60_000;
+const ASSET_RETRY_COOLDOWN_MS = 5 * 60_000;
 const ENTRY_OPENING_DELAY_MINUTES = 5;
 const ENTRY_CLOSING_BUFFER_MINUTES = 30;
 const ONLINE_UNIVERSE_REFRESH_MS = 5 * 60_000;
@@ -539,7 +540,18 @@ function activeStockSession(phase: StockPaperMarketStatus["phase"]): boolean {
     phase === "AFTER_HOURS";
 }
 
+class StockPaperAssetInventoryUnavailableError extends Error {
+  constructor(retryAfterMs: number, options: { cause?: unknown } = {}) {
+    super(
+      `Alpaca Assets inventory is unavailable; retry after ${new Date(retryAfterMs).toISOString()}.`,
+      options
+    );
+    this.name = "StockPaperAssetInventoryUnavailableError";
+  }
+}
+
 function safeError(error: unknown): string {
+  if (error instanceof StockPaperAssetInventoryUnavailableError) return error.message;
   if (error instanceof Error) {
     if (/401|403|credential|secret|key/iu.test(error.message)) {
       return "Alpaca authentication or authorization failed.";
@@ -570,10 +582,16 @@ interface StockPaperCycleNewsEvidence {
 }
 
 export class StockPaperEngine {
-  private tail: Promise<void> = Promise.resolve();
+  private activeCycle: Promise<void> | undefined;
+  private pendingCycle: {
+    promise: Promise<void>;
+    resolve: () => void;
+    reject: (reason?: unknown) => void;
+  } | undefined;
   private learningTail: Promise<void> = Promise.resolve();
   private lastLearningCheckpointAt = 0;
   private assetsByDay = new Map<string, AlpacaStockAsset[]>();
+  private assetRetryAfterByKey = new Map<string, number>();
   private benchmarkStartPrice: number | undefined;
   private lastClosedScanAt = 0;
   private lastOvernightAssetRefreshAt = 0;
@@ -605,15 +623,54 @@ export class StockPaperEngine {
 
   enqueueCycle(): Promise<void> {
     if (this.stopped) return Promise.resolve();
-    const run = this.tail.then(() => this.runCycle());
-    this.tail = run.catch((error) => {
-      this.options.onError?.(error);
-    });
+    if (!this.activeCycle) return this.launchCycle();
+    if (!this.pendingCycle) {
+      let resolve!: () => void;
+      let reject!: (reason?: unknown) => void;
+      const promise = new Promise<void>((pendingResolve, pendingReject) => {
+        resolve = pendingResolve;
+        reject = pendingReject;
+      });
+      this.pendingCycle = { promise, resolve, reject };
+    }
+    return this.pendingCycle.promise;
+  }
+
+  private launchCycle(): Promise<void> {
+    const run = Promise.resolve().then(() => this.runCycle());
+    this.activeCycle = run;
+    void run.then(
+      () => this.finishCycle(),
+      (error) => {
+        try {
+          this.options.onError?.(error);
+        } catch {
+          // Diagnostics cannot prevent the single pending cycle from running.
+        }
+        this.finishCycle();
+      }
+    );
     return run;
   }
 
+  private finishCycle(): void {
+    this.activeCycle = undefined;
+    const pending = this.pendingCycle;
+    this.pendingCycle = undefined;
+    if (!pending) return;
+    if (this.stopped) {
+      pending.resolve();
+      return;
+    }
+    const next = this.launchCycle();
+    void next.then(pending.resolve, pending.reject);
+  }
+
   async drain(): Promise<void> {
-    await this.tail;
+    while (this.activeCycle || this.pendingCycle) {
+      const pending = this.pendingCycle?.promise ?? this.activeCycle!;
+      await pending.catch(() => undefined);
+    }
     await this.learningTail;
   }
 
@@ -883,21 +940,60 @@ export class StockPaperEngine {
       }
       const assetDayKey = dayKey;
       const assetCacheKey = `${assetDayKey}:${latestFeed}`;
-      let assets = this.assetsByDay.get(assetCacheKey);
       const overnightAssetsStale = phase === "OVERNIGHT" &&
         nowDate.getTime() - this.lastOvernightAssetRefreshAt >= OVERNIGHT_ASSET_REFRESH_MS;
-      if (!assets || overnightAssetsStale) {
-        assets = (await request(() => provider.getAssets())).filter(baseEligibleAsset);
-        if (phase === "OVERNIGHT") this.lastOvernightAssetRefreshAt = nowDate.getTime();
-        this.assetsByDay.set(assetCacheKey, assets);
+      const loadAssetsForKey = async (
+        cacheKey: string,
+        refresh: boolean
+      ): Promise<{ assets: AlpacaStockAsset[]; refreshed: boolean }> => {
+        const cached = this.assetsByDay.get(cacheKey);
+        if (!refresh && cached !== undefined) return { assets: cached, refreshed: false };
+        const retryAfter = this.assetRetryAfterByKey.get(cacheKey);
+        if (retryAfter !== undefined && nowDate.getTime() < retryAfter) {
+          if (cached === undefined) {
+            throw new StockPaperAssetInventoryUnavailableError(retryAfter);
+          }
+          endpointFailures.push({
+            endpoint: "assets",
+            required: false,
+            message: `Alpaca Assets refresh is cooling down; exact-key cached eligibility is in use until ${new Date(retryAfter).toISOString()}.`
+          });
+          return { assets: cached, refreshed: false };
+        }
+        try {
+          const next = (await request(() => provider.getAssets())).filter(baseEligibleAsset);
+          this.assetsByDay.set(cacheKey, next);
+          this.assetRetryAfterByKey.delete(cacheKey);
+          return { assets: next, refreshed: true };
+        } catch (error) {
+          const failedAt = this.options.now?.() ?? new Date();
+          const nextRetryAt = failedAt.getTime() + ASSET_RETRY_COOLDOWN_MS;
+          this.assetRetryAfterByKey.set(cacheKey, nextRetryAt);
+          if (cached === undefined) {
+            throw new StockPaperAssetInventoryUnavailableError(nextRetryAt, { cause: error });
+          }
+          endpointFailures.push({
+            endpoint: "assets",
+            required: false,
+            message: `Alpaca Assets refresh failed; exact-key cached eligibility is in use until ${new Date(nextRetryAt).toISOString()}.`
+          });
+          return { assets: cached, refreshed: false };
+        }
+      };
+      const primaryAssets = await loadAssetsForKey(
+        assetCacheKey,
+        !this.assetsByDay.has(assetCacheKey) || overnightAssetsStale
+      );
+      const assets = primaryAssets.assets;
+      if (phase === "OVERNIGHT" && primaryAssets.refreshed) {
+        this.lastOvernightAssetRefreshAt = nowDate.getTime();
       }
       if (phase !== "OVERNIGHT" && overnightAssetPrewarmWindow(now)) {
         const upcomingTradeDayKey = stockTradeDayKey(new Date(nowDate.getTime() + 10 * 60_000));
         const overnightCacheKey = `${upcomingTradeDayKey}:overnight`;
         if (!this.assetsByDay.has(overnightCacheKey)) {
-          const overnightAssets = (await request(() => provider.getAssets())).filter(baseEligibleAsset);
-          this.assetsByDay.set(overnightCacheKey, overnightAssets);
-          this.lastOvernightAssetRefreshAt = nowDate.getTime();
+          const overnightAssets = await loadAssetsForKey(overnightCacheKey, true);
+          if (overnightAssets.refreshed) this.lastOvernightAssetRefreshAt = nowDate.getTime();
         }
       }
 

@@ -9,6 +9,7 @@ import {
 } from "./http.js";
 import { OneRequestPerSecondQueue } from "./birdeye.js";
 import {
+  BIRDEYE_SOL_USD_HISTORY_PREVIOUS_5M_SOURCE,
   BIRDEYE_SOL_USD_HISTORY_SOURCE,
   type SolUsdHistoricalPrice,
   type SolUsdHistoricalPriceProvider
@@ -111,9 +112,11 @@ function requestCredits(candles: number): 45 | 75 | 100 {
 
 /**
  * Authenticated managed-provider fallback for Pyth Benchmarks. It downloads
- * real Birdeye 5-minute SOL/USD candles in bounded pages and admits only the
- * opening mark at an exact ten-minute grid timestamp. No interpolation,
- * padding, forward-fill, or synthesized confidence values are used.
+ * real Birdeye 5-minute SOL/USD candles in bounded pages. It prefers the exact
+ * ten-minute grid candle; when Birdeye omits that bucket with padding disabled,
+ * it may admit only the real candle exactly five minutes earlier under a
+ * distinct provenance source. No interpolation, provider padding, unlabeled
+ * carry-forward, or synthesized confidence values are used.
  */
 export class BirdeyeSolUsdHistoryClient implements SolUsdHistoricalPriceProvider {
   readonly authenticationConfigured = true;
@@ -128,6 +131,7 @@ export class BirdeyeSolUsdHistoryClient implements SolUsdHistoricalPriceProvider
   private readonly onRequest: NonNullable<BirdeyeSolUsdHistoryOptions["onRequest"]>;
   private readonly queue: OneRequestPerSecondQueue;
   private readonly pricesByTimestamp = new Map<number, number>();
+  private readonly fetchedRanges: Array<{ startSeconds: number; endSeconds: number }> = [];
 
   constructor(apiKey: string, options: BirdeyeSolUsdHistoryOptions = {}) {
     this.apiKey = normalizedApiKey(apiKey);
@@ -141,10 +145,10 @@ export class BirdeyeSolUsdHistoryClient implements SolUsdHistoricalPriceProvider
       ?? DEFAULT_MAXIMUM_CANDLES_PER_REQUEST;
     if (
       !Number.isSafeInteger(this.maximumCandlesPerRequest)
-      || this.maximumCandlesPerRequest < 2
+      || this.maximumCandlesPerRequest < 3
       || this.maximumCandlesPerRequest > 5_000
     ) {
-      throw new RangeError("Birdeye SOL/USD history maximumCandlesPerRequest must be from 2 to 5000.");
+      throw new RangeError("Birdeye SOL/USD history maximumCandlesPerRequest must be from 3 to 5000.");
     }
     this.onRequest = options.onRequest ?? (() => undefined);
     this.queue = new OneRequestPerSecondQueue(
@@ -162,24 +166,69 @@ export class BirdeyeSolUsdHistoryClient implements SolUsdHistoricalPriceProvider
     ) {
       throw new RangeError("Birdeye SOL/USD history timestamp must be a positive ten-minute Unix grid point.");
     }
-    if (!this.pricesByTimestamp.has(timestampSeconds)) {
+    if (
+      !this.pricesByTimestamp.has(timestampSeconds)
+      && !this.fetchedRanges.some((range) =>
+        timestampSeconds >= range.startSeconds && timestampSeconds <= range.endSeconds)
+    ) {
       await this.fetchPage(timestampSeconds);
     }
-    const priceUsd = this.pricesByTimestamp.get(timestampSeconds);
-    if (priceUsd === undefined) {
-      throw new BirdeyeSolUsdHistoryValidationError("TARGET_MISSING");
+    let priceUsd = this.pricesByTimestamp.get(timestampSeconds);
+    if (priceUsd !== undefined) {
+      return {
+        source: BIRDEYE_SOL_USD_HISTORY_SOURCE,
+        requestedTimestampSeconds: timestampSeconds,
+        observationTimestampSeconds: timestampSeconds,
+        priceUsd,
+        ...this.followingObservation(timestampSeconds)
+      };
     }
+
+    // padding=false deliberately leaves real provider holes visible. Re-read
+    // only the three-candle neighborhood so an exact candle wins if the broad
+    // page was incomplete, then admit at most the real preceding 5m candle.
+    // No future, older, interpolated, padded, or synthesized mark is accepted.
+    const previousTimestampSeconds = timestampSeconds - BIRDEYE_SOL_USD_HISTORY_CANDLE_SECONDS;
+    await this.fetchPage(previousTimestampSeconds, 3);
+    priceUsd = this.pricesByTimestamp.get(timestampSeconds);
+    if (priceUsd !== undefined) {
+      return {
+        source: BIRDEYE_SOL_USD_HISTORY_SOURCE,
+        requestedTimestampSeconds: timestampSeconds,
+        observationTimestampSeconds: timestampSeconds,
+        priceUsd,
+        ...this.followingObservation(timestampSeconds)
+      };
+    }
+    priceUsd = this.pricesByTimestamp.get(previousTimestampSeconds);
+    if (priceUsd === undefined) throw new BirdeyeSolUsdHistoryValidationError("TARGET_MISSING");
     return {
-      source: BIRDEYE_SOL_USD_HISTORY_SOURCE,
+      source: BIRDEYE_SOL_USD_HISTORY_PREVIOUS_5M_SOURCE,
       requestedTimestampSeconds: timestampSeconds,
-      observationTimestampSeconds: timestampSeconds,
-      priceUsd
+      observationTimestampSeconds: previousTimestampSeconds,
+      priceUsd,
+      ...this.followingObservation(timestampSeconds)
     };
   }
 
-  private async fetchPage(startSeconds: number): Promise<void> {
+  private followingObservation(timestampSeconds: number): Pick<SolUsdHistoricalPrice, "followingObservation"> | Record<string, never> {
+    const observationTimestampSeconds = timestampSeconds + BIRDEYE_SOL_USD_HISTORY_CANDLE_SECONDS;
+    const priceUsd = this.pricesByTimestamp.get(observationTimestampSeconds);
+    return priceUsd === undefined ? {} : {
+      followingObservation: {
+        source: BIRDEYE_SOL_USD_HISTORY_SOURCE,
+        observationTimestampSeconds,
+        priceUsd
+      }
+    };
+  }
+
+  private async fetchPage(
+    startSeconds: number,
+    candleCount = this.maximumCandlesPerRequest
+  ): Promise<void> {
     const endSeconds = startSeconds
-      + (this.maximumCandlesPerRequest - 1) * BIRDEYE_SOL_USD_HISTORY_CANDLE_SECONDS;
+      + (candleCount - 1) * BIRDEYE_SOL_USD_HISTORY_CANDLE_SECONDS;
     const endpoint = new URL("/defi/v3/ohlcv", this.baseUrl);
     endpoint.searchParams.set("address", SOL_MINT);
     endpoint.searchParams.set("type", "5m");
@@ -196,7 +245,7 @@ export class BirdeyeSolUsdHistoryClient implements SolUsdHistoricalPriceProvider
       payload = await this.queue.schedule(async () => {
         this.onRequest({
           path: "/defi/v3/ohlcv",
-          credits: requestCredits(this.maximumCandlesPerRequest)
+          credits: requestCredits(candleCount)
         });
         return requestJson(endpoint, {
           method: "GET",
@@ -219,7 +268,7 @@ export class BirdeyeSolUsdHistoryClient implements SolUsdHistoricalPriceProvider
     }
 
     const items = candleItems(payload);
-    if (items.length > this.maximumCandlesPerRequest) {
+    if (items.length > candleCount) {
       throw new BirdeyeSolUsdHistoryValidationError("CANDLE_COUNT");
     }
     const page = new Map<number, number>();
@@ -265,5 +314,6 @@ export class BirdeyeSolUsdHistoryClient implements SolUsdHistoricalPriceProvider
       page.set(timestamp, open);
     }
     for (const [timestamp, price] of page) this.pricesByTimestamp.set(timestamp, price);
+    this.fetchedRanges.push({ startSeconds, endSeconds });
   }
 }

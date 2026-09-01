@@ -453,7 +453,7 @@ export class AlpacaPaperProvider {
   async getClock(): Promise<AlpacaMarketClock> {
     const row = asRecord(await this.request<unknown>(
       `${ALPACA_PAPER_TRADING_ORIGIN}/v2/clock`,
-      "Alpaca Paper"
+      "Alpaca Market Clock"
     ));
     const timestamp = stringValue(row?.timestamp);
     const nextOpen = stringValue(row?.next_open);
@@ -545,7 +545,7 @@ export class AlpacaPaperProvider {
   async getAssets(): Promise<AlpacaStockAsset[]> {
     const rows = await this.request<unknown>(
       `${ALPACA_PAPER_TRADING_ORIGIN}/v2/assets?status=active&asset_class=us_equity`,
-      "Alpaca Paper"
+      "Alpaca Assets"
     );
     if (!Array.isArray(rows)) throw new Error("Alpaca asset response was invalid.");
     return rows.flatMap((value): AlpacaStockAsset[] => {

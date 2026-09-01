@@ -1,5 +1,7 @@
 # Solana Copy Lab
 
+[![CI](https://github.com/vgcman16/solana-copy-lab/actions/workflows/ci.yml/badge.svg)](https://github.com/vgcman16/solana-copy-lab/actions/workflows/ci.yml)
+
 Solana Copy Lab is a local Windows dashboard for testing whether profitable public wallets can still be profitable after their trades are copied with a small bankroll. This run starts with a simulated $141 portfolio and cannot enter unattended live mode until the full paper and manual-live gates pass.
 
 This is a controlled experiment, not a promise of income. It can lose money. Historical wallet profit does not guarantee future results, and the computer must remain awake and online while monitoring.

@@ -88,11 +88,27 @@ describe("PythBenchmarksClient", () => {
   });
 
   it.each([
+    ["exact requested time", TIMESTAMP],
+    ["maximum forward boundary", TIMESTAMP + 60]
+  ])("accepts a valid observation at the %s", async (_label, publishTime) => {
+    const client = new PythBenchmarksClient({
+      fetch: mockFetch(() => jsonResponse(validResponse({ publishTime })))
+    });
+
+    await expect(client.getSolUsdPrice(TIMESTAMP)).resolves.toMatchObject({
+      requestedTimestampSeconds: TIMESTAMP,
+      observationTimestampSeconds: publishTime,
+      publishTimeSeconds: publishTime
+    });
+  });
+
+  it.each([
     ["PARSED_SHAPE", validResponse({ parsed: [] })],
     ["FEED_ID", validResponse({ id: "0".repeat(64) })],
     ["PRICE_SHAPE", validResponse({ price: null })],
     ["MANTISSA", validResponse({ price: { price: "7.8", conf: "1", expo: -8, publish_time: TIMESTAMP } })],
     ["EXPONENT", validResponse({ expo: -19 })],
+    ["PUBLISH_TIME", validResponse({ publishTime: TIMESTAMP - 1 })],
     ["PUBLISH_TIME", validResponse({ publishTime: TIMESTAMP + 61 })],
     ["CONFIDENCE", validResponse({ conf: "-1" })],
     ["CONFIDENCE", validResponse({
