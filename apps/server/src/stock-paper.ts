@@ -188,13 +188,32 @@ function latestCausalTimestamp(
   return new Date(latest).toISOString();
 }
 
-function sellEvidenceTimeoutAt(
+export function stockPaperSellEvidenceTimeoutAt(
   submittedAt: string,
   phase: StockPaperMarketStatus["phase"]
 ): string {
-  return new Date(
-    Date.parse(submittedAt) + stockPaperMaximumBarAgeMs(phase) + SELL_EVIDENCE_GRACE_MS
-  ).toISOString();
+  const submittedAtMs = Date.parse(submittedAt);
+  const ordinaryTimeoutMs = submittedAtMs +
+    stockPaperMaximumBarAgeMs(phase) +
+    SELL_EVIDENCE_GRACE_MS;
+  if (phase !== "PREMARKET") return new Date(ordinaryTimeoutMs).toISOString();
+
+  const easternMinutes = easternSessionMinutes(submittedAt);
+  if (easternMinutes < 240 || easternMinutes >= 480) {
+    return new Date(ordinaryTimeoutMs).toISOString();
+  }
+
+  // BOATS stops at 04:00 ET, while the free IEX venue cannot provide
+  // actionable prices until its 08:00 ET session. Expiring a PAPER exit every
+  // few minutes inside that deterministic no-evidence gap creates replacement
+  // orders that cannot possibly fill. Keep one finite order alive through the
+  // first IEX evidence window; execution remains blocked until both a fresh
+  // quote and a completed causal IEX bar actually arrive.
+  const firstIexEvidenceTimeoutMs = submittedAtMs +
+    (480 - easternMinutes) * 60_000 +
+    stockPaperMaximumBarAgeMs(phase) +
+    SELL_EVIDENCE_GRACE_MS;
+  return new Date(Math.max(ordinaryTimeoutMs, firstIexEvidenceTimeoutMs)).toISOString();
 }
 
 function asExecutionOrder(order: StockPaperOrder): StockPaperLimitOrderV3 {
@@ -2305,7 +2324,7 @@ export class StockPaperEngine {
           continue;
         }
         const evidenceTimeoutAt = currentOrder.evidenceTimeoutAt ??
-          sellEvidenceTimeoutAt(currentOrder.submittedAt, currentOrder.phase);
+          stockPaperSellEvidenceTimeoutAt(currentOrder.submittedAt, currentOrder.phase);
         const evidenceTimeoutMs = Date.parse(evidenceTimeoutAt);
         const phaseOrFeedChanged = currentOrder.phase !== phase || currentOrder.feed !== marketFeed;
         const evidenceTimedOut = !Number.isFinite(evidenceTimeoutMs) ||
@@ -2635,7 +2654,16 @@ export class StockPaperEngine {
               ...(phase === "REGULAR" && minutesRemaining !== undefined
                 ? { sessionMinutesRemaining: minutesRemaining }
                 : phase === "OVERNIGHT" && overnightFeedMinutesRemaining !== undefined
-                  ? { sessionMinutesRemaining: overnightFeedMinutesRemaining }
+                  ? {
+                      // Free BOATS history is delayed. Start a SESSION_END
+                      // liquidation early enough for a strictly later bar to
+                      // become observable before the 04:00 ET feed boundary.
+                      sessionMinutesRemaining: Math.max(
+                        0,
+                        overnightFeedMinutesRemaining -
+                          lane.policy.overnightDerivedLimitConfirmationMinutes
+                      )
+                    }
                 : extendedDiscontinuity !== undefined
                   ? { sessionMinutesRemaining: extendedDiscontinuity }
                   : {}),
@@ -2675,7 +2703,7 @@ export class StockPaperEngine {
         const sellOrderId = rolloverOrder
           ? rolloverOrderId(rolloverOrder, phase, marketFeed)
           : orderId(lane.id, now, marked.symbol, "SELL");
-        const expiresAt = sellEvidenceTimeoutAt(now, phase);
+        const expiresAt = stockPaperSellEvidenceTimeoutAt(now, phase);
         const requestedQuantity = rolloverOrder?.requestedQuantity ?? marked.quantity;
         const filledQuantity = rolloverOrder?.filledQuantity ?? 0;
         const carriedFills = rolloverOrder?.fills ?? [];

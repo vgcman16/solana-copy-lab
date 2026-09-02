@@ -300,6 +300,109 @@ describe("operational telemetry", () => {
     ]));
   });
 
+  it("labels an exactly capped and drained managed snapshot without warning when its trading head is healthy", () => {
+    const repository = openFileRepository();
+    const wallets = ["leader-a", "leader-b", "leader-c"];
+    seedActivePaperCohort(repository, wallets);
+    for (const wallet of wallets) completeCurrentRepair(repository, wallet);
+    repository.setSetting("wallet_acquisition_goal_v1", {
+      version: 1,
+      targetWallets: 25_000,
+      status: "SATISFIED",
+      qualifiedWallets: 3,
+      updatedAt: isoBefore(60),
+      budgetBlockers: []
+    });
+    repository.db.prepare(`
+      UPDATE wallet_index_metrics SET integer_value = 25000 WHERE metric = 'indexedWallets'
+    `).run();
+    repository.db.prepare(`
+      UPDATE wallet_index_metrics SET text_value = ? WHERE metric = 'newestBlockTime'
+    `).run(isoBefore(24 * 60 * 60));
+    repository.saveWalletIndexCheckpoint({
+      pipeline: "helius-jupiter-program-index",
+      partition: "program-1",
+      completed: true,
+      updatedAt: isoBefore(24 * 60 * 60),
+      lastSignature: "historical-snapshot-head",
+      slot: 100
+    });
+    const fileSystem: OperationalTelemetryFileSystem = {
+      fileSize: () => 1_024,
+      driveCapacity: () => ({ availableBytes: 500 * GIB, totalBytes: 1_000 * GIB })
+    };
+    const healthyStream = {
+      dataProviderMode: "MANAGED" as const,
+      streamStatus: {
+        active: true,
+        connected: true,
+        ready: true,
+        lastMessageAt: isoBefore(30)
+      }
+    };
+
+    const capped = collectOperationalTelemetry(repository, NOW, fileSystem, healthyStream);
+    expect(capped).toMatchObject({
+      status: "HEALTHY",
+      blocksNewEntries: false,
+      issues: [],
+      indexQueue: {
+        managedSnapshotCapped: true,
+        headProgramsReady: 0,
+        headProgramsRequired: 1,
+        headCatchupComplete: false
+      },
+      tradingHead: { healthy: true }
+    });
+
+    insertQueue(repository.db, "new-discovery-work", "PENDING", isoBefore(60));
+    const activeWork = collectOperationalTelemetry(repository, NOW, fileSystem, healthyStream);
+    expect(activeWork).toMatchObject({
+      status: "WARNING",
+      blocksNewEntries: false,
+      indexQueue: { managedSnapshotCapped: false }
+    });
+    expect(activeWork.issues).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "INDEX_HEAD_STALE", severity: "WARNING" })
+    ]));
+
+    repository.db.prepare("DELETE FROM index_signature_queue WHERE signature = 'new-discovery-work'").run();
+
+    const shadowProfile = collectOperationalTelemetry(repository, NOW, fileSystem, {
+      ...healthyStream,
+      dataProviderMode: "SHADOW"
+    });
+    expect(shadowProfile).toMatchObject({
+      status: "WARNING",
+      blocksNewEntries: false,
+      indexQueue: { managedSnapshotCapped: false },
+      tradingHead: { healthy: true }
+    });
+    expect(shadowProfile.issues).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "INDEX_HEAD_STALE", severity: "WARNING" })
+    ]));
+
+    const unhealthyAuthority = collectOperationalTelemetry(repository, NOW, fileSystem, {
+      dataProviderMode: "MANAGED",
+      streamStatus: {
+        active: true,
+        connected: false,
+        ready: false,
+        lastMessageAt: isoBefore(30)
+      }
+    });
+    expect(unhealthyAuthority).toMatchObject({
+      status: "CRITICAL",
+      blocksNewEntries: true,
+      indexQueue: { managedSnapshotCapped: true },
+      tradingHead: { healthy: false }
+    });
+    expect(unhealthyAuthority.issues).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "INDEX_HEAD_STALE", severity: "WARNING" }),
+      expect.objectContaining({ code: "MONITORING_STREAM_UNHEALTHY", severity: "CRITICAL" })
+    ]));
+  });
+
   it("fails closed for each active-wallet repair, stream, and source-processing break", () => {
     const repository = openFileRepository();
     const wallets = ["leader-a", "leader-b", "leader-c"];

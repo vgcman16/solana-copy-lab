@@ -3369,6 +3369,13 @@ export interface OperationalIndexQueueTelemetry {
   leased: number;
   retry: number;
   failed: number;
+  /**
+   * True only when managed discovery has reached its fixed maximum wallet
+   * target and has no active or unresolved index work. The historical program
+   * head remains visible below, but active-wallet streams are the trading
+   * authority for the frozen PAPER cohort in this state.
+   */
+  managedSnapshotCapped: boolean;
   /** Programs with a durable bootstrap or maintenance-head checkpoint. */
   headProgramsRequired: number;
   /** Programs with a fresh, cursor-free, continuous committed head range. */

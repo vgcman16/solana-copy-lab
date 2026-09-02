@@ -1,4 +1,5 @@
 import type {
+  DataProviderMode,
   OperationalAuditTelemetry,
   OperationalIndexQueueTelemetry,
   OperationalMonitoringRepairTelemetry,
@@ -13,6 +14,10 @@ import type {
 import { statfsSync, statSync } from "node:fs";
 import { dirname } from "node:path";
 import type { Repository } from "./repository.js";
+import {
+  WALLET_ACQUISITION_GOAL_SETTING,
+  type PersistedWalletAcquisitionGoal
+} from "./wallet-acquisition-controller.js";
 
 const AUDIT_WINDOW_HOURS = 24 as const;
 const GIB = 1024 ** 3;
@@ -20,8 +25,11 @@ const PROGRAM_INDEX_PIPELINE = "helius-jupiter-program-index";
 const PROGRAM_HEAD_PIPELINE = "helius-jupiter-program-head";
 const HEAD_FRESHNESS_SECONDS = 15 * 60;
 const WALLET_STREAM_FRESHNESS_SECONDS = 60;
+const MANAGED_WALLET_INDEX_CAP = 25_000;
 
 export interface OperationalTelemetryRuntimeState {
+  /** Active credential-vault profile. Omission is fail-closed. */
+  dataProviderMode?: DataProviderMode;
   streamStatus?: {
     active: boolean;
     connected: boolean;
@@ -84,6 +92,29 @@ function oldestQueueTime(repository: Repository): string | undefined {
     return row ? [row.discovered_at] : [];
   });
   return rows.sort()[0];
+}
+
+function managedSnapshotIsCapped(
+  repository: Repository,
+  coverage: ReturnType<Repository["walletIndexCoverage"]>,
+  dataProviderMode: DataProviderMode | undefined
+): boolean {
+  // The durable acquisition goal intentionally survives provider changes, so
+  // it cannot establish current MANAGED authority by itself.
+  if (dataProviderMode !== "MANAGED") return false;
+  const value = repository.getSetting<unknown>(WALLET_ACQUISITION_GOAL_SETTING);
+  if (!value || typeof value !== "object") return false;
+  const goal = value as Partial<PersistedWalletAcquisitionGoal>;
+  const unresolved = coverage.queueByStatus.PENDING +
+    coverage.queueByStatus.LEASED +
+    coverage.queueByStatus.RETRY +
+    coverage.queueByStatus.FAILED;
+  return goal.version === 1 &&
+    goal.targetWallets === MANAGED_WALLET_INDEX_CAP &&
+    (goal.status === "SATISFIED" || goal.status === "MAXIMUM_REACHED") &&
+    coverage.indexedWallets >= MANAGED_WALLET_INDEX_CAP &&
+    coverage.activeRuns === 0 &&
+    unresolved === 0;
 }
 
 function collectHeadIntegrity(repository: Repository, now: Date): Pick<
@@ -193,7 +224,11 @@ function collectStorage(
   };
 }
 
-function collectIndexQueue(repository: Repository, now: Date): OperationalIndexQueueTelemetry {
+function collectIndexQueue(
+  repository: Repository,
+  now: Date,
+  dataProviderMode: DataProviderMode | undefined
+): OperationalIndexQueueTelemetry {
   const coverage = repository.walletIndexCoverage(now);
   const queueTotal = Object.values(coverage.queueByStatus)
     .reduce((sum, value) => sum + safeInteger(value, "Index queue count"), 0);
@@ -213,6 +248,7 @@ function collectIndexQueue(repository: Repository, now: Date): OperationalIndexQ
     leased: safeInteger(coverage.queueByStatus.LEASED, "Leased queue count"),
     retry: safeInteger(coverage.queueByStatus.RETRY, "Retry queue count"),
     failed: safeInteger(coverage.queueByStatus.FAILED, "Failed queue count"),
+    managedSnapshotCapped: managedSnapshotIsCapped(repository, coverage, dataProviderMode),
     ...headIntegrity,
     ...(oldestBacklogAt
       ? {
@@ -463,9 +499,13 @@ function assess(
   if (indexQueue.retry > 0) {
     issue(issues, "WARNING", "INDEX_RETRY_PENDING", "Index transactions are waiting for retry.");
   }
+  const discoveryHeadRequiresAlert =
+    !indexQueue.managedSnapshotCapped || tradingHead?.healthy !== true;
   if (
-    !indexQueue.headCatchupComplete ||
-    (indexQueue.newestIndexedBlockLagSeconds ?? 0) >= HEAD_FRESHNESS_SECONDS
+    discoveryHeadRequiresAlert && (
+      !indexQueue.headCatchupComplete ||
+      (indexQueue.newestIndexedBlockLagSeconds ?? 0) >= HEAD_FRESHNESS_SECONDS
+    )
   ) {
     issue(
       issues,
@@ -475,7 +515,10 @@ function assess(
         ? "The discovery index head is stale or incomplete; active-wallet monitoring is evaluated separately."
         : "The confirmed index head is stale or its continuous catch-up is incomplete."
     );
-  } else if ((indexQueue.newestIndexedBlockLagSeconds ?? 0) >= 5 * 60) {
+  } else if (
+    discoveryHeadRequiresAlert &&
+    (indexQueue.newestIndexedBlockLagSeconds ?? 0) >= 5 * 60
+  ) {
     issue(issues, "WARNING", "INDEX_HEAD_AGING", "The newest indexed block is at least five minutes behind this host's clock.");
   }
   if (tradingHead) {
@@ -539,7 +582,7 @@ export function collectOperationalTelemetry(
   const capturedAt = now.toISOString();
   try {
     const { storage, inMemory } = collectStorage(repository, fileSystem);
-    const indexQueue = collectIndexQueue(repository, now);
+    const indexQueue = collectIndexQueue(repository, now, runtimeState.dataProviderMode);
     const monitoringRepair = collectMonitoringRepair(repository, now);
     const tradingHead = collectTradingHead(repository, now, runtimeState);
     const audit = collectAudit(repository, now);

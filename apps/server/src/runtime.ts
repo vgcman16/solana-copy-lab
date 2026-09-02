@@ -51,6 +51,7 @@ import {
   type AlpacaPaperCredentials,
   type ChampionPromotionDecision,
   type CopyIntent,
+  type DataProviderMode,
   type DataProviderProfile,
   type BrokerOrder,
   type ExecutionRecord,
@@ -106,7 +107,10 @@ import {
 import { ShadowChainProvider } from "./chain-provider-parity.js";
 import { DurableProviderParitySink } from "./provider-parity-proof.js";
 import { ProviderParityBaselineCoordinator } from "./provider-parity-coordinator.js";
-import { LocalSolPriceOracle } from "./local-sol-price.js";
+import {
+  LocalSolPriceOracle,
+  isSolPriceCoverageGapAcceptable
+} from "./local-sol-price.js";
 import { SolPriceBootstrapWorker } from "./sol-price-bootstrap.js";
 import type { SolPriceBootstrapStatus } from "./sol-price-bootstrap-state.js";
 import { normalizeDataProviderProfile } from "./provider-profile.js";
@@ -463,10 +467,20 @@ export class TradingRuntime implements RuntimeController {
   private providerDrain: Promise<void> | undefined;
   private providerDiscoveryRequired = false;
   private readonly providerWorkTasks = new Set<Promise<unknown>>();
+  /** Full multi-provider health cycles are tracked separately from ordinary
+   * background writes so credential/profile transitions can drain them before
+   * replacing the provider composition. */
+  private readonly providerHealthRefreshes = new Set<Promise<void>>();
   private readonly backgroundWriteTasks = new Set<Promise<unknown>>();
   private readonly researchMonitoringWallets = new Set<string>();
   private autonomousMarketTail: Promise<void> = Promise.resolve();
   private lastAutonomousMarketHealth: ProviderHealth | undefined;
+  /** Coalesce periodic/preflight observers onto one complete seven-category
+   * diagnostic. Without this guard, two callers arriving before the first
+   * paced request set finished could duplicate the entire account-wide queue. */
+  private autonomousMarketHealthRefresh:
+    | { generation: number; promise: Promise<ProviderHealth> }
+    | undefined;
   /**
    * Jupiter's general free-tier allowance is account-wide, so every token,
    * market, health, and quote client owned by this runtime shares this physical
@@ -802,6 +816,16 @@ export class TradingRuntime implements RuntimeController {
         if (rejected) throw rejected.reason;
       });
     }
+    const providerHealthRefreshes = [...this.providerHealthRefreshes];
+    if (providerHealthRefreshes.length > 0) {
+      await settle("provider_health", async () => {
+        const results = await Promise.allSettled(providerHealthRefreshes);
+        const rejected = results.find((result): result is PromiseRejectedResult =>
+          result.status === "rejected" && !(result.reason instanceof ProviderWorkSupersededError)
+        );
+        if (rejected) throw rejected.reason;
+      });
+    }
     const backgroundWriteTasks = [...this.backgroundWriteTasks];
     if (backgroundWriteTasks.length > 0) {
       await settle("background_writes", async () => {
@@ -953,8 +977,19 @@ export class TradingRuntime implements RuntimeController {
       // A later transition attempt takes ownership of a timed-out drain. The
       // generation bump prevents the prior attempt's deferred recovery from
       // resuming provider work underneath this caller.
-      this.providerWorkGeneration += 1;
-      if (this.providerDrain) await boundedProviderDrain(this.providerDrain);
+      const generation = ++this.providerWorkGeneration;
+      const drain = this.providerDrain;
+      if (drain) {
+        try {
+          await boundedProviderDrain(drain);
+          if (this.providerDrain === drain) this.providerDrain = undefined;
+        } catch (error) {
+          if (error instanceof ProviderQuiesceTimeoutError) {
+            this.scheduleProviderDrainRecovery(drain, generation);
+          }
+          throw error;
+        }
+      }
       return;
     }
 
@@ -973,11 +1008,17 @@ export class TradingRuntime implements RuntimeController {
     const indexer = this.walletIndexer;
     const parsedBlockRepair = this.parsedBlockRepairWorker;
     const inFlightProviderTasks = [...this.providerWorkTasks];
+    const providerHealthRefreshes = [...this.providerHealthRefreshes];
+    const autonomousMarketHealthRefresh = this.autonomousMarketHealthRefresh?.promise;
     const drain = (async (): Promise<void> => {
       await Promise.all([
         indexer?.stop(),
         parsedBlockRepair?.stop(),
         ...inFlightProviderTasks.map((task) => task.then(
+          () => undefined,
+          () => undefined
+        )),
+        ...providerHealthRefreshes.map((task) => task.then(
           () => undefined,
           () => undefined
         ))
@@ -994,6 +1035,7 @@ export class TradingRuntime implements RuntimeController {
       await this.researchPaper.drain().catch(() => undefined);
       await this.autonomousPaper.drain().catch(() => undefined);
       await this.autonomousMarketTail.catch(() => undefined);
+      await autonomousMarketHealthRefresh?.catch(() => undefined);
     })();
     this.providerDrain = drain;
 
@@ -1006,21 +1048,25 @@ export class TradingRuntime implements RuntimeController {
         // method before committing. Resume that same provider composition
         // only after the real drain completes, unless another transition or
         // shutdown has superseded this recovery generation.
-        void drain.then(async () => {
-          if (this.providerDrain === drain) this.providerDrain = undefined;
-          if (
-            !this.stopping &&
-            this.providerWorkQuiesced &&
-            this.providerWorkGeneration === generation
-          ) {
-            await this.resumeProviderWork();
-          }
-        }).catch((drainError) => {
-          this.recordError("provider_quiesce_recovery", drainError);
-        });
+        this.scheduleProviderDrainRecovery(drain, generation);
       }
       throw error;
     }
+  }
+
+  private scheduleProviderDrainRecovery(drain: Promise<void>, generation: number): void {
+    void drain.then(async () => {
+      if (this.providerDrain === drain) this.providerDrain = undefined;
+      if (
+        !this.stopping &&
+        this.providerWorkQuiesced &&
+        this.providerWorkGeneration === generation
+      ) {
+        await this.resumeProviderWork();
+      }
+    }).catch((drainError) => {
+      this.recordError("provider_quiesce_recovery", drainError);
+    });
   }
 
   async resumeProviderWork(): Promise<void> {
@@ -1041,14 +1087,15 @@ export class TradingRuntime implements RuntimeController {
     await this.recreateSolPriceBootstrapClient();
     await this.configureProviders();
     await this.refreshActiveRpcReadiness();
-    await this.refreshHealth(true);
+    await this.refreshHealth(true, { allowQuiescedMarketHealth: true });
     if (!this.providerWorkQuiesced) this.activateProviderWork(this.providerWorkGeneration);
   }
 
   async dataProviderProfileChanged(): Promise<void> {
+    await this.recreateSolPriceBootstrapClient("profile");
     await this.configureProviders();
     await this.refreshActiveRpcReadiness();
-    await this.refreshHealth(true);
+    await this.refreshHealth(true, { allowQuiescedMarketHealth: true });
     if (!this.providerWorkQuiesced) this.activateProviderWork(this.providerWorkGeneration);
   }
 
@@ -1160,6 +1207,7 @@ export class TradingRuntime implements RuntimeController {
       };
       return universe;
     } catch (error) {
+      this.assertProviderWorkCurrent(generation);
       this.lastAutonomousMarketHealth = {
         provider: "jupiter",
         ok: false,
@@ -1194,18 +1242,61 @@ export class TradingRuntime implements RuntimeController {
     return run;
   }
 
-  private async checkAutonomousMarketHealth(): Promise<ProviderHealth> {
+  private assertAutonomousMarketHealthRefreshCurrent(
+    generation: number,
+    allowQuiesced: boolean
+  ): void {
+    if (
+      this.stopping ||
+      generation !== this.providerWorkGeneration ||
+      (this.providerWorkQuiesced && !allowQuiesced)
+    ) throw new ProviderWorkSupersededError();
+  }
+
+  private async checkAutonomousMarketHealth(allowQuiesced = false): Promise<ProviderHealth> {
+    const generation = this.providerWorkGeneration;
+    this.assertAutonomousMarketHealthRefreshCurrent(generation, allowQuiesced);
     const cached = this.lastAutonomousMarketHealth;
     if (
       cached &&
       Date.now() - Date.parse(cached.checkedAt) <= AUTONOMOUS_MARKET_HEALTH_CACHE_TTL_MS
     ) return cached;
-    await this.signalTail.catch(() => undefined);
-    const health = await this.runAutonomousMarketTask(
-      () => this.requireProviders().market.checkHealth()
-    );
-    this.lastAutonomousMarketHealth = health;
-    return health;
+    const existing = this.autonomousMarketHealthRefresh;
+    if (existing?.generation === generation) return existing.promise;
+
+    const refresh = (async (): Promise<ProviderHealth> => {
+      await this.signalTail.catch(() => undefined);
+      this.assertAutonomousMarketHealthRefreshCurrent(generation, allowQuiesced);
+      // A full universe scan checks the same seven authenticated category
+      // endpoints. Let an already-running scan finish, then reuse the health
+      // evidence it records instead of appending seven redundant paced GETs.
+      await this.autonomousMarketTail;
+      this.assertAutonomousMarketHealthRefreshCurrent(generation, allowQuiesced);
+      const afterMarketWork = this.lastAutonomousMarketHealth;
+      if (
+        afterMarketWork &&
+        Date.now() - Date.parse(afterMarketWork.checkedAt) <= AUTONOMOUS_MARKET_HEALTH_CACHE_TTL_MS
+      ) return afterMarketWork;
+
+      const health = await this.runAutonomousMarketTask(
+        () => this.requireProviders().market.checkHealth()
+      );
+      // Credential/profile transitions advance this generation before they
+      // drain the old provider. Never publish its late health result into the
+      // newly configured provider's cache.
+      this.assertAutonomousMarketHealthRefreshCurrent(generation, allowQuiesced);
+      this.lastAutonomousMarketHealth = health;
+      return health;
+    })();
+    const active = { generation, promise: refresh };
+    this.autonomousMarketHealthRefresh = active;
+    try {
+      return await refresh;
+    } finally {
+      if (this.autonomousMarketHealthRefresh === active) {
+        this.autonomousMarketHealthRefresh = undefined;
+      }
+    }
   }
 
   async preflightModeChange(mode: ModeState): Promise<void> {
@@ -1386,6 +1477,7 @@ export class TradingRuntime implements RuntimeController {
   }
 
   operationalTelemetry(now = new Date()): OperationalTelemetrySnapshot {
+    const dataProviderMode: DataProviderMode = this.vault.getDataProviderProfile().mode;
     const chain = this.providers?.chain;
     const streamStatus = chain && typeof chain.getStreamStatus === "function"
       ? chain.getStreamStatus()
@@ -1394,7 +1486,10 @@ export class TradingRuntime implements RuntimeController {
       this.repository,
       now,
       undefined,
-      streamStatus ? { streamStatus } : {}
+      {
+        dataProviderMode,
+        ...(streamStatus ? { streamStatus } : {})
+      }
     );
   }
 
@@ -2136,7 +2231,7 @@ export class TradingRuntime implements RuntimeController {
     });
   }
 
-  private async recreateSolPriceBootstrapClient(): Promise<void> {
+  private async recreateSolPriceBootstrapClient(change: "credentials" | "profile" = "credentials"): Promise<void> {
     if (this.solPriceBootstrapWorkerOverride) return;
     const previous = this.solPriceBootstrap.status();
     await this.solPriceBootstrap.pause();
@@ -2145,8 +2240,10 @@ export class TradingRuntime implements RuntimeController {
     this.events.publish("sol-price-bootstrap", current);
     if (previous.activeInProcess) {
       this.repository.audit(
-        "sol_price_bootstrap_credentials_changed",
-        "The active SOL/USD history bootstrap was paused before its provider client was recreated. Explicit resume is required.",
+        change === "profile"
+          ? "sol_price_bootstrap_profile_changed"
+          : "sol_price_bootstrap_credentials_changed",
+        `The active SOL/USD history bootstrap was paused before its provider client was recreated after a provider ${change} change. Explicit resume is required.`,
         { completedPoints: current.completedPoints, totalPoints: current.totalPoints },
         "warning"
       );
@@ -2179,7 +2276,12 @@ export class TradingRuntime implements RuntimeController {
   }
 
   private async configureProviders(): Promise<void> {
-    const configuredGeneration = this.providerWorkGeneration;
+    // A provider composition can be replaced more than once inside one
+    // quiesced transition (for example, a failed validation followed by
+    // rollback). Give every concrete composition its own generation so late
+    // diagnostics from the rejected composition cannot publish into the one
+    // that replaces it.
+    const configuredGeneration = ++this.providerWorkGeneration;
     if (this.monitoringRepairRetryTimer) clearTimeout(this.monitoringRepairRetryTimer);
     this.monitoringRepairRetryTimer = undefined;
     if (this.researchMonitoringRetryTimer) clearTimeout(this.researchMonitoringRetryTimer);
@@ -3194,7 +3296,12 @@ export class TradingRuntime implements RuntimeController {
 
   private pauseForMonitoringRepair(addresses: readonly string[]): void {
     const previous = this.operationalPauseState();
-    const reasons: OperationalPauseReason[] = [...previous.reasons];
+    // A prior automatic local-data label may describe the old process rather
+    // than this new, explicit repair cycle. Replace only that generic reason;
+    // manual-review, loss, balance, execution, and provider holds survive.
+    const reasons: OperationalPauseReason[] = previous.reasons.filter(
+      (reason) => reason !== "LOCAL_DATA_UNHEALTHY"
+    );
     if (!reasons.includes("HISTORY_GAP_REPAIR")) reasons.push("HISTORY_GAP_REPAIR");
     this.persistOperationalPause(reasons, false, { wallets: [...addresses] });
   }
@@ -4619,19 +4726,59 @@ export class TradingRuntime implements RuntimeController {
     }
   }
 
-  private async refreshHealth(includeBirdeye: boolean): Promise<void> {
-    if (!this.providers) return;
+  private async refreshHealth(
+    includeBirdeye: boolean,
+    options: { allowQuiescedMarketHealth?: boolean } = {}
+  ): Promise<void> {
+    const providers = this.providers;
+    if (!providers) return;
+    const generation = this.providerWorkGeneration;
+    const allowQuiesced = options.allowQuiescedMarketHealth === true;
+    this.assertAutonomousMarketHealthRefreshCurrent(generation, allowQuiesced);
     const activeProfile = this.vault.getDataProviderProfile();
+    const refresh = this.performHealthRefresh(
+      providers,
+      activeProfile,
+      includeBirdeye,
+      generation,
+      allowQuiesced
+    );
+    this.providerHealthRefreshes.add(refresh);
+    try {
+      await refresh;
+    } finally {
+      this.providerHealthRefreshes.delete(refresh);
+    }
+  }
+
+  private async performHealthRefresh(
+    providers: Providers,
+    activeProfile: DataProviderProfile,
+    includeBirdeye: boolean,
+    generation: number,
+    allowQuiesced: boolean
+  ): Promise<void> {
     const tasks: Array<Promise<ProviderHealth>> = [
-      this.providers.chain.checkHealth(),
-      this.providers.token.checkHealth(),
-      this.providers.swap.checkHealth(),
-      this.checkAutonomousMarketHealth()
+      providers.chain.checkHealth(),
+      providers.token.checkHealth(),
+      providers.swap.checkHealth(),
+      this.checkAutonomousMarketHealth(allowQuiesced)
     ];
     if (includeBirdeye || activeProfile.mode === "SELF_HOSTED") {
-      tasks.push(this.providers.discovery.checkHealth());
+      tasks.push(providers.discovery.checkHealth());
     }
-    const results = await Promise.all(tasks);
+    // Keep the cycle registered until every request has settled. Promise.all
+    // would release the quiesce drain as soon as the first provider failed,
+    // allowing slower requests from that same obsolete composition to cross
+    // the vault commit.
+    const settled = await Promise.allSettled(tasks);
+    this.assertAutonomousMarketHealthRefreshCurrent(generation, allowQuiesced);
+    if (this.providers !== providers) throw new ProviderWorkSupersededError();
+    const rejected = settled.find(
+      (result): result is PromiseRejectedResult => result.status === "rejected"
+    );
+    if (rejected) throw rejected.reason;
+    const results = settled.map((result) => (result as PromiseFulfilledResult<ProviderHealth>).value);
     const tokenHealth = results.find((health, index) => health.provider === "jupiter" && index === 1);
     const swapHealth = results.find((health, index) => health.provider === "jupiter" && index === 2);
     const marketHealth = results.find((health, index) => health.provider === "jupiter" && index === 3);
@@ -4652,10 +4799,10 @@ export class TradingRuntime implements RuntimeController {
       });
     }
     const heliusIndex = combined.findIndex((health) => health.provider === "helius");
-    const streamStatus = this.providers.chain.getStreamStatus();
+    const streamStatus = providers.chain.getStreamStatus();
     if (heliusIndex >= 0 && streamStatus.active) {
       const rpcHealth = combined[heliusIndex]!;
-      const streamHealth = this.providers.chain.getStreamHealth(60_000);
+      const streamHealth = providers.chain.getStreamHealth(60_000);
       combined[heliusIndex] = {
         ...rpcHealth,
         ok: rpcHealth.ok && streamHealth.ok,
@@ -4677,6 +4824,11 @@ export class TradingRuntime implements RuntimeController {
         };
       }
     }
+    // No asynchronous boundary follows this assertion: all durable health,
+    // outage, soak, and event writes below are committed atomically with
+    // respect to provider-generation changes on this event loop.
+    this.assertAutonomousMarketHealthRefreshCurrent(generation, allowQuiesced);
+    if (this.providers !== providers) throw new ProviderWorkSupersededError();
     for (const health of combined) {
       this.repository.setProviderHealth(health);
       if (health.provider === "helius") {
@@ -4772,7 +4924,7 @@ export class TradingRuntime implements RuntimeController {
       priceCoverage.pendingSwapReprices === 0 &&
       Number.isFinite(newestPriceAt) &&
       observedAt.getTime() - newestPriceAt <= SELF_HOSTED_PAPER_SOAK_MAXIMUM_AGE_MS &&
-      priceCoverage.largestGapSeconds <= 10 * 60;
+      isSolPriceCoverageGapAcceptable(priceCoverage.largestGapSeconds);
     const emergencyRpcHealthy = emergencyExitRpcFresh(activeEmergencyExitRpcStatus(
       profile,
       this.repository.getSetting<StoredEmergencyExitRpcStatus>(EMERGENCY_EXIT_RPC_STATUS_SETTING)
@@ -4899,11 +5051,25 @@ export class TradingRuntime implements RuntimeController {
       recentExecutions: this.repository.listExecutions(100)
     });
     const reasons: OperationalPauseReason[] = [...stop.reasons];
-    if (this.monitoringRepairPending() && !reasons.includes("HISTORY_GAP_REPAIR")) {
+    const monitoringRepairPending = this.monitoringRepairPending();
+    const operationalTelemetry = this.operationalTelemetry();
+    const repairTransitionBlock =
+      operationalTelemetry.blockingIssueCodes.length > 0 &&
+      operationalTelemetry.blockingIssueCodes.every((code) =>
+        code === "MONITORING_REPAIR_FAILED" || code === "MONITORING_STREAM_UNHEALTHY"
+      );
+    // Keep one precise restart marker from the first repair through the
+    // subscription acknowledgement. Repair checkpoints can all become READY
+    // a few milliseconds before the provider reports its stream as ready.
+    const startupRepairTransition = monitoringRepairPending || (
+      previousPause.reasons.includes("HISTORY_GAP_REPAIR") && repairTransitionBlock
+    );
+    if (startupRepairTransition && !reasons.includes("HISTORY_GAP_REPAIR")) {
       reasons.push("HISTORY_GAP_REPAIR");
     }
     if (
-      this.operationalTelemetry().blocksNewEntries &&
+      operationalTelemetry.blocksNewEntries &&
+      !(startupRepairTransition && repairTransitionBlock) &&
       !reasons.includes("LOCAL_DATA_UNHEALTHY")
     ) {
       reasons.push("LOCAL_DATA_UNHEALTHY");

@@ -13,9 +13,9 @@ import {
   type ProviderParityProofEpoch
 } from "./provider-parity-proof.js";
 import { inactiveSelfHostedPaperSoak } from "./self-hosted-paper-soak.js";
+import { isSolPriceCoverageGapAcceptable } from "./local-sol-price.js";
 
 const DAY_MS = 86_400_000;
-const MAXIMUM_SOL_PRICE_GAP_SECONDS = 10 * 60;
 const MAXIMUM_RPC_READINESS_AGE_MS = 10 * 60_000;
 const MAXIMUM_SHADOW_HEALTH_GAP_MS = 15 * 60_000;
 const MAXIMUM_SHADOW_HEALTH_AGE_MS = 10 * 60_000;
@@ -255,10 +255,7 @@ export function calculateProviderReadiness(input: ProviderReadinessInput): DataP
   if (newestPrice === undefined || newestPrice < now.getTime() - 10 * 60_000) {
     blockers.push("local SOL/USD price history is stale");
   }
-  if (
-    input.priceCoverage.largestGapSeconds !== undefined &&
-    input.priceCoverage.largestGapSeconds > MAXIMUM_SOL_PRICE_GAP_SECONDS
-  ) {
+  if (!isSolPriceCoverageGapAcceptable(input.priceCoverage.largestGapSeconds)) {
     blockers.push("local SOL/USD price history contains a gap longer than ten minutes");
   }
   if ((input.priceCoverage.pendingSwapReprices ?? 0) > 0) {

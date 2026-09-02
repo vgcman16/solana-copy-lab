@@ -49,6 +49,10 @@ class FakeWebSocket implements WebSocketLike {
     this.emit("message", { data: JSON.stringify(payload) });
   }
 
+  error() {
+    this.emit("error", {});
+  }
+
   private emit(type: string, event: unknown) {
     for (const listener of this.listeners.get(type) ?? []) listener(event);
   }
@@ -117,6 +121,87 @@ describe("HeliusObserver", () => {
       await vi.advanceTimersByTimeAsync(20);
       await vi.advanceTimersByTimeAsync(25);
       expect(attempts).toEqual([0, 10, 30, 55]);
+      await unsubscribe();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("coalesces connection-error warnings and keeps backoff elevated until gap repair completes", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    try {
+      const sockets: FakeWebSocket[] = [];
+      const errors: Error[] = [];
+      let historyCalls = 0;
+      let releaseRepair!: (response: Response) => void;
+      const repairResponse = new Promise<Response>((resolve) => {
+        releaseRepair = resolve;
+      });
+      const observer = new HeliusObserver("key", {
+        websocketFactory: () => {
+          const socket = new FakeWebSocket();
+          sockets.push(socket);
+          return socket;
+        },
+        fetch: mockFetch((url) => {
+          if (url.pathname.endsWith("/history")) {
+            historyCalls += 1;
+            return historyCalls === 1
+              ? repairResponse
+              : jsonResponse({ data: [], pagination: { hasMore: false, nextCursor: null } });
+          }
+          throw new Error(`Unexpected request: ${url}`);
+        }),
+        reconnectBaseMs: 20,
+        reconnectMaximumMs: 80,
+        jitter: () => 1,
+        heartbeatMs: 600_000,
+        onError: (error) => errors.push(error)
+      });
+
+      const unsubscribe = await observer.subscribe([TEST_WALLET], async () => undefined);
+      sockets[0]?.open();
+      const firstRequest = JSON.parse(sockets[0]?.sent[0] ?? "{}") as { id: number };
+      sockets[0]?.message({ jsonrpc: "2.0", id: firstRequest.id, result: 41 });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(observer.getStreamStatus().ready).toBe(true);
+
+      sockets[0]?.error();
+      expect(errors.map((error) => error.message)).toEqual([
+        "Helius WebSocket reported a connection error"
+      ]);
+      await vi.advanceTimersByTimeAsync(20);
+      expect(sockets).toHaveLength(2);
+
+      sockets[1]?.open();
+      const reconnectRequest = JSON.parse(sockets[1]?.sent[0] ?? "{}") as { id: number };
+      sockets[1]?.message({ jsonrpc: "2.0", id: reconnectRequest.id, result: 42 });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(observer.getStreamStatus()).toMatchObject({ ready: false, gapRepairPending: true });
+
+      sockets[1]?.error();
+      expect(errors.map((error) => error.message)).toEqual([
+        "Helius WebSocket reported a connection error"
+      ]);
+      await vi.advanceTimersByTimeAsync(20);
+      expect(sockets).toHaveLength(2);
+      await vi.advanceTimersByTimeAsync(20);
+      expect(sockets).toHaveLength(3);
+
+      sockets[2]?.open();
+      const stableRequest = JSON.parse(sockets[2]?.sent[0] ?? "{}") as { id: number };
+      sockets[2]?.message({ jsonrpc: "2.0", id: stableRequest.id, result: 43 });
+      releaseRepair(jsonResponse({ data: [], pagination: { hasMore: false, nextCursor: null } }));
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(observer.getStreamStatus()).toMatchObject({ ready: true, gapRepairPending: false });
+
+      sockets[2]?.error();
+      expect(errors.map((error) => error.message)).toEqual([
+        "Helius WebSocket reported a connection error",
+        "Helius WebSocket reported a connection error"
+      ]);
       await unsubscribe();
     } finally {
       vi.useRealTimers();
@@ -296,6 +381,51 @@ describe("HeliusObserver", () => {
       baseAmountUi: 4,
       targetAmountUi: 2
     });
+  });
+
+  it("gives Wallet History one bounded slow-response window without extending RPC timeouts", async () => {
+    vi.useFakeTimers();
+    try {
+      let release!: (response: Response) => void;
+      let historySignal: AbortSignal | null | undefined;
+      const historyResponse = new Promise<Response>((resolve) => { release = resolve; });
+      const observer = new HeliusObserver("key", {
+        timeoutMs: 12_000,
+        fetch: mockFetch((_url, init) => {
+          historySignal = init?.signal;
+          return historyResponse;
+        })
+      });
+
+      const repair = observer.repairGap(TEST_WALLET, "2024-07-03T09:40:00Z");
+      await vi.advanceTimersByTimeAsync(12_001);
+      expect(historySignal?.aborted).toBe(false);
+      release(jsonResponse({ data: [], pagination: { hasMore: false, nextCursor: null } }));
+      await expect(repair).resolves.toEqual([]);
+
+      expect(() => new HeliusObserver("key", { historyTimeoutMs: 0 }))
+        .toThrow("historyTimeoutMs must be a positive number");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps ATA-complete qualification history while repair mirrors direct wallet mentions", async () => {
+    const tokenAccountModes: string[] = [];
+    const observer = new HeliusObserver("key", {
+      fetch: mockFetch((url) => {
+        if (!url.pathname.endsWith("/history")) {
+          return jsonResponse({ data: { tags: [] } });
+        }
+        tokenAccountModes.push(url.searchParams.get("tokenAccounts") ?? "missing");
+        return jsonResponse({ data: [], pagination: { hasMore: false, nextCursor: null } });
+      })
+    });
+
+    await observer.summarizeHistory(TEST_WALLET, 90);
+    await observer.repairGap(TEST_WALLET, "2024-07-03T09:40:00Z");
+
+    expect(tokenAccountModes).toEqual(["balanceChanged", "none"]);
   });
 
   it("repairs non-swap history into recovered research inventory evidence only when enabled", async () => {

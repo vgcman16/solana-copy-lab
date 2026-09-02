@@ -1,12 +1,35 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { BIRDEYE_SOL_USD_HISTORY_PREVIOUS_5M_SOURCE } from "@copylab/providers";
 import { openDatabase, type CopyLabDatabase } from "../src/database.js";
-import { LocalSolPriceOracle } from "../src/local-sol-price.js";
+import {
+  LocalSolPriceOracle,
+  isSolPriceCoverageGapAcceptable
+} from "../src/local-sol-price.js";
 import { Repository } from "../src/repository.js";
 
 describe("LocalSolPriceOracle", () => {
   let db: CopyLabDatabase | undefined;
   afterEach(() => db?.close());
+
+  it("allows only subsecond capture jitter at the ten-minute coverage boundary", () => {
+    expect(isSolPriceCoverageGapAcceptable(600)).toBe(true);
+    expect(isSolPriceCoverageGapAcceptable(600.048)).toBe(true);
+    expect(isSolPriceCoverageGapAcceptable(600.999)).toBe(true);
+    expect(isSolPriceCoverageGapAcceptable(601)).toBe(false);
+    expect(isSolPriceCoverageGapAcceptable(Number.NaN)).toBe(false);
+    expect(isSolPriceCoverageGapAcceptable(-1)).toBe(false);
+  });
+
+  it("preserves the exact measured jitter in telemetry while accepting the coverage cadence", () => {
+    db = openDatabase(":memory:");
+    const oracle = new LocalSolPriceOracle(new Repository(db));
+    oracle.record(150, "2026-07-10T11:49:59.952Z", "fixture");
+    oracle.record(151, "2026-07-10T12:00:00.000Z", "fixture");
+
+    const coverage = oracle.coverage();
+    expect(coverage.largestGapSeconds).toBeCloseTo(600.048, 3);
+    expect(isSolPriceCoverageGapAcceptable(coverage.largestGapSeconds)).toBe(true);
+  });
 
   it("selects only the newest at-or-before price and exposes durable coverage", () => {
     db = openDatabase(":memory:");

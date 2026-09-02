@@ -38,6 +38,10 @@ const CLIENT_STREAM_ERROR_CLOSE_CODE = 4000;
 // healthy subscribed wallet look like an outage.
 const DEFAULT_HEARTBEAT_MS = 30_000;
 const DEFAULT_LIVENESS_TIMEOUT_MS = 90_000;
+// Wallet history performs server-side ATA expansion and swap filtering. Active
+// wallets can legitimately take longer than the lightweight RPC probes, so it
+// gets one bounded request window without multiplying quota through retries.
+const DEFAULT_WALLET_HISTORY_TIMEOUT_MS = 30_000;
 
 export interface WebSocketLike {
   readonly readyState: number;
@@ -55,6 +59,9 @@ export interface HeliusOptions {
   fetch?: FetchLike;
   websocketFactory?: (url: string) => WebSocketLike;
   timeoutMs?: number;
+  /** Per-page Wallet History timeout. Defaults to a bounded 30 seconds while
+   * RPC, identity, and live hydration retain the shorter general timeout. */
+  historyTimeoutMs?: number;
   maxHistoryPages?: number;
   reconnectBaseMs?: number;
   reconnectMaximumMs?: number;
@@ -99,6 +106,8 @@ interface HistoryResult {
   truncated: boolean;
 }
 
+type WalletHistoryTokenAccounts = "none" | "balanceChanged";
+
 interface PendingLiveSignature {
   signature: string;
   wallet: string;
@@ -131,6 +140,8 @@ interface SubscriptionState {
   lastSeenAt: Map<string, Date>;
   pendingLiveSignatures: Map<string, PendingLiveSignature>;
   processingTail: Promise<void>;
+  /** Coalesces the low-information WebSocket error event for one outage. */
+  connectionErrorReported: boolean;
 }
 
 class RequestIntervalQueue {
@@ -187,6 +198,7 @@ export class HeliusObserver implements ChainObserver {
   private readonly fetch: FetchLike | undefined;
   private readonly websocketFactory: (url: string) => WebSocketLike;
   private readonly timeoutMs: number;
+  private readonly historyTimeoutMs: number;
   private readonly maxHistoryPages: number;
   private readonly reconnectBaseMs: number;
   private readonly reconnectMaximumMs: number;
@@ -229,6 +241,10 @@ export class HeliusObserver implements ChainObserver {
     this.websocketFactory =
       options.websocketFactory ?? ((url) => new WebSocket(url) as unknown as WebSocketLike);
     this.timeoutMs = options.timeoutMs ?? 12_000;
+    this.historyTimeoutMs = options.historyTimeoutMs ?? DEFAULT_WALLET_HISTORY_TIMEOUT_MS;
+    if (!Number.isFinite(this.historyTimeoutMs) || this.historyTimeoutMs <= 0) {
+      throw new RangeError("Helius historyTimeoutMs must be a positive number");
+    }
     this.maxHistoryPages = Math.max(1, options.maxHistoryPages ?? 100);
     this.reconnectBaseMs = Math.max(10, options.reconnectBaseMs ?? 1_000);
     this.reconnectMaximumMs = Math.max(this.reconnectBaseMs, options.reconnectMaximumMs ?? 30_000);
@@ -273,7 +289,10 @@ export class HeliusObserver implements ChainObserver {
     }
     const now = this.now();
     const since = new Date(now.getTime() - days * 86_400_000);
-    const history = await this.fetchHistory(address, since);
+    // Qualification needs ATA-inclusive history to measure complete holding
+    // and concentration evidence, even when the wallet is not a transaction
+    // account itself.
+    const history = await this.fetchHistory(address, since, "balanceChanged");
     const tagsPromise = this.fetchIdentityTags(address);
     const decodedSwaps = history.entries
       .map((entry) =>
@@ -366,7 +385,11 @@ export class HeliusObserver implements ChainObserver {
     if (!address) throw new Error("Helius gap repair requires a wallet address");
     const sinceDate = validTimestamp(since);
     const now = this.now();
-    const history = await this.fetchHistory(address, sinceDate);
+    // Gap repair mirrors logsSubscribe(address): leaders are monitored as the
+    // directly-mentioned fee-paying signer. Avoid Wallet API's substantially
+    // heavier ATA expansion here; every returned signature is still hydrated
+    // and passed through the strict transaction decoder below.
+    const history = await this.fetchHistory(address, sinceDate, "none");
     if (history.truncated && !history.reachedCutoff) {
       throw new Error(
         `Helius gap repair reached the ${this.maxHistoryPages}-page safety cap before ${sinceDate.toISOString()}; operation fails closed`
@@ -433,7 +456,8 @@ export class HeliusObserver implements ChainObserver {
       subscriptionWallets: new Map(),
       lastSeenAt: new Map(uniqueAddresses.map((address) => [address, connectedAt])),
       pendingLiveSignatures: new Map(),
-      processingTail: Promise.resolve()
+      processingTail: Promise.resolve(),
+      connectionErrorReported: false
     };
     this.activeSubscription = state;
     this.connect(state);
@@ -655,7 +679,14 @@ export class HeliusObserver implements ChainObserver {
       void this.handleWebSocketMessage(state, socket, event?.data);
     });
     socket.addEventListener("error", () => {
-      this.report(new Error("Helius WebSocket reported a connection error"));
+      // WHATWG WebSocket error events intentionally expose no actionable
+      // transport detail. Report the outage transition once, while the
+      // stream health and reconnect state continue to fail closed, instead
+      // of writing the same warning on every backoff attempt.
+      if (!state.connectionErrorReported) {
+        state.connectionErrorReported = true;
+        this.report(new Error("Helius WebSocket reported a connection error"));
+      }
       if (!state.stopped && state.socket === socket) {
         socket.close(CLIENT_STREAM_ERROR_CLOSE_CODE, "connection error");
       }
@@ -848,8 +879,9 @@ export class HeliusObserver implements ChainObserver {
   private subscriptionsReady(state: SubscriptionState, socket: WebSocketLike): void {
     if (state.ackTimer) clearTimeout(state.ackTimer);
     state.ackTimer = undefined;
-    state.reconnectAttempt = 0;
     if (!state.repairOnAck) {
+      state.reconnectAttempt = 0;
+      state.connectionErrorReported = false;
       state.gapRepairPending = false;
       state.gapRepairFailed = false;
       return;
@@ -878,6 +910,11 @@ export class HeliusObserver implements ChainObserver {
         state.gapRepairPending = false;
         state.gapRepairFailed = false;
         state.gapRepairAttempt = 0;
+        // Do not reset reconnect pacing merely because a replacement socket
+        // opened and acknowledged. A recovery is stable only after its
+        // history gap and buffered live notifications have been reconciled.
+        state.reconnectAttempt = 0;
+        state.connectionErrorReported = false;
       })
       .catch((error) => {
         if (state.stopped || state.socket !== socket) return;
@@ -976,7 +1013,11 @@ export class HeliusObserver implements ChainObserver {
     }
   }
 
-  private async fetchHistory(address: string, since: Date): Promise<HistoryResult> {
+  private async fetchHistory(
+    address: string,
+    since: Date,
+    tokenAccounts: WalletHistoryTokenAccounts
+  ): Promise<HistoryResult> {
     const entries: unknown[] = [];
     let before: string | undefined;
     let reachedCutoff = false;
@@ -985,7 +1026,7 @@ export class HeliusObserver implements ChainObserver {
       const url = new URL(`${this.walletApiBaseUrl}/v1/wallet/${encodeURIComponent(address)}/history`);
       url.searchParams.set("limit", "100");
       url.searchParams.set("type", "SWAP");
-      url.searchParams.set("tokenAccounts", "balanceChanged");
+      url.searchParams.set("tokenAccounts", tokenAccounts);
       if (before) url.searchParams.set("before", before);
       this.requestCount += 1;
       this.onRequest({ service: "wallet", method: "history", credits: 100 });
@@ -994,7 +1035,7 @@ export class HeliusObserver implements ChainObserver {
       }, {
         provider: "Helius Wallet API",
         fetch: this.fetch,
-        timeoutMs: this.timeoutMs
+        timeoutMs: this.historyTimeoutMs
       }));
       const response = asRecord(payload);
       const pageEntries = Array.isArray(response?.data) ? response.data : undefined;

@@ -179,6 +179,148 @@ describe("autonomous PAPER runtime isolation", () => {
     expect(checkHealth).toHaveBeenCalledTimes(2);
   });
 
+  it("coalesces concurrent autonomous market-health diagnostics", async () => {
+    const { runtime } = setup();
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    const checkHealth = vi.fn(async () => {
+      await pending;
+      return {
+        provider: "jupiter" as const,
+        ok: true,
+        checkedAt: new Date().toISOString(),
+        message: "all seven market categories healthy"
+      };
+    });
+    const harness = runtime as unknown as {
+      providers: unknown;
+      checkAutonomousMarketHealth(): Promise<unknown>;
+    };
+    harness.providers = { market: { checkHealth } };
+
+    const first = harness.checkAutonomousMarketHealth();
+    const second = harness.checkAutonomousMarketHealth();
+    await vi.waitFor(() => expect(checkHealth).toHaveBeenCalledTimes(1));
+    release();
+
+    await expect(Promise.all([first, second])).resolves.toHaveLength(2);
+    expect(checkHealth).toHaveBeenCalledTimes(1);
+  });
+
+  it("discards an in-flight market-health result when its provider generation is superseded", async () => {
+    const { runtime } = setup();
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    const checkHealth = vi.fn(async () => {
+      await pending;
+      return {
+        provider: "jupiter" as const,
+        ok: true,
+        checkedAt: new Date().toISOString(),
+        message: "old provider healthy"
+      };
+    });
+    const harness = runtime as unknown as {
+      providers: unknown;
+      providerWorkGeneration: number;
+      lastAutonomousMarketHealth?: unknown;
+      autonomousMarketHealthRefresh?: unknown;
+      checkAutonomousMarketHealth(): Promise<unknown>;
+    };
+    harness.providers = { market: { checkHealth } };
+
+    const oldHealth = harness.checkAutonomousMarketHealth();
+    await vi.waitFor(() => expect(checkHealth).toHaveBeenCalledTimes(1));
+    harness.providerWorkGeneration += 1;
+    release();
+
+    await expect(oldHealth).rejects.toThrow("Provider-owned work was superseded");
+    expect(harness.lastAutonomousMarketHealth).toBeUndefined();
+    expect(harness.autonomousMarketHealthRefresh).toBeUndefined();
+  });
+
+  it("allows only an explicitly authorized same-generation health refresh while quiesced", async () => {
+    const { runtime } = setup();
+    const checkHealth = vi.fn(async () => ({
+      provider: "jupiter" as const,
+      ok: true,
+      checkedAt: new Date().toISOString(),
+      message: "new provider healthy"
+    }));
+    const harness = runtime as unknown as {
+      providers: unknown;
+      providerWorkQuiesced: boolean;
+      checkAutonomousMarketHealth(allowQuiesced?: boolean): Promise<unknown>;
+    };
+    harness.providers = { market: { checkHealth } };
+    harness.providerWorkQuiesced = true;
+
+    await expect(harness.checkAutonomousMarketHealth()).rejects.toThrow(
+      "Provider-owned work was superseded"
+    );
+    await expect(harness.checkAutonomousMarketHealth(true)).resolves.toMatchObject({
+      ok: true,
+      message: "new provider healthy"
+    });
+    expect(checkHealth).toHaveBeenCalledOnce();
+  });
+
+  it("does not publish failed market health when a universe scan is superseded", async () => {
+    const { repository, runtime } = setup();
+    createLane(repository);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const fetchSignalUniverse = vi.fn(async () => {
+      await gate;
+      return [];
+    });
+    const preservedHealth = {
+      provider: "jupiter" as const,
+      ok: true,
+      checkedAt: new Date().toISOString(),
+      message: "current provider health"
+    };
+    const harness = runtime as unknown as {
+      providers: unknown;
+      providerWorkGeneration: number;
+      lastAutonomousMarketHealth?: unknown;
+      fetchAutonomousSignalUniverse(): Promise<unknown>;
+    };
+    harness.providers = { market: { fetchSignalUniverse } };
+
+    const scan = harness.fetchAutonomousSignalUniverse();
+    await vi.waitFor(() => expect(fetchSignalUniverse).toHaveBeenCalledOnce());
+    harness.providerWorkGeneration += 1;
+    harness.lastAutonomousMarketHealth = preservedHealth;
+    release();
+
+    await expect(scan).rejects.toThrow("Provider-owned work was superseded");
+    expect(harness.lastAutonomousMarketHealth).toBe(preservedHealth);
+  });
+
+  it("still publishes failed market health for a current-generation universe failure", async () => {
+    const { repository, runtime } = setup();
+    createLane(repository);
+    const harness = runtime as unknown as {
+      providers: unknown;
+      lastAutonomousMarketHealth?: { ok: boolean; message: string };
+      fetchAutonomousSignalUniverse(): Promise<unknown>;
+    };
+    harness.providers = {
+      market: {
+        fetchSignalUniverse: async () => {
+          throw new Error("current provider outage");
+        }
+      }
+    };
+
+    await expect(harness.fetchAutonomousSignalUniverse()).rejects.toThrow("current provider outage");
+    expect(harness.lastAutonomousMarketHealth).toMatchObject({
+      ok: false,
+      message: "Jupiter autonomous market category scan failed safely"
+    });
+  });
+
   it("queues cycles only in exact PAPER with configured providers and an active lane", async () => {
     const { repository, runtime } = setup();
     createLane(repository);

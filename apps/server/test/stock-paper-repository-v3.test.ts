@@ -209,6 +209,23 @@ describe("StockPaperRepository v3 learning ledger", () => {
       expect.objectContaining({ phase: "AFTER_HOURS", totalObservations: 0 }),
       expect.objectContaining({ phase: "OVERNIGHT", totalObservations: 0 })
     ]);
+    const followupObservation: StockPaperObservation = {
+      ...observation,
+      id: `${observation.id}:followup`,
+      symbol: "MSFT",
+      candidate: { ...observation.candidate, symbol: "MSFT" }
+    };
+    repository.commitCycle({
+      ...commit,
+      observations: [followupObservation],
+      outcomes: []
+    });
+    expect(repository.dashboard().learning).toMatchObject({
+      observations: 2,
+      labeledOutcomes: 1,
+      missingOutcomes: 0,
+      pendingOutcomes: 5
+    });
     expect(() => repository.commitCycle({
       ...commit,
       observations: [{ ...observation, reasons: ["different evidence"] }],

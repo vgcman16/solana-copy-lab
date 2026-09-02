@@ -217,7 +217,14 @@ function OperationalTelemetryPanel({ telemetry: input }: { telemetry?: Operation
             <div><dt>Pending / leased</dt><dd>{count(queue.pending)} / {count(queue.leased)}</dd></div>
             <div><dt>Retry</dt><dd className={queue.retry > 0 ? "warning" : ""}>{count(queue.retry)}</dd></div>
             <div><dt>Failed</dt><dd className={queue.failed > 0 ? "negative" : ""}>{count(queue.failed)}</dd></div>
-            <div><dt>{tradingHead ? "Discovery heads" : "Continuous heads"}</dt><dd className={queue.headCatchupComplete ? "" : tradingHead ? "warning" : "negative"}>{count(queue.headProgramsReady)} / {count(queue.headProgramsRequired)} · {count(queue.headUnprocessed)} hydrating</dd></div>
+            <div>
+              <dt>{queue.managedSnapshotCapped ? "Discovery scope" : tradingHead ? "Discovery heads" : "Continuous heads"}</dt>
+              <dd className={queue.managedSnapshotCapped ? "" : queue.headCatchupComplete ? "" : tradingHead ? "warning" : "negative"}>
+                {queue.managedSnapshotCapped
+                  ? "25,000 capped · leader streams authoritative"
+                  : `${count(queue.headProgramsReady)} / ${count(queue.headProgramsRequired)} · ${count(queue.headUnprocessed)} hydrating`}
+              </dd>
+            </div>
             <div><dt>Oldest / head lag</dt><dd>{duration(queue.oldestBacklogAgeSeconds)} / {duration(queue.newestIndexedBlockLagSeconds)}</dd></div>
           </dl> : <p>Index queue telemetry unavailable.</p>}
         </article>

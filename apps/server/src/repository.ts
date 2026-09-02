@@ -1868,6 +1868,17 @@ export class Repository implements ManagedRecoveryPreflightRepository {
   private walletPreScreenSurvivorRevision = 0;
   private readonly walletPreScreenSurvivorCache = new Map<string, readonly string[]>();
   private walletPreScreenSurvivorCacheClearScheduled = false;
+  // The funnel aggregate extracts a few legacy fields from every wallet JSON
+  // row and is expensive enough to stall a dashboard refresh once the local
+  // index reaches tens of thousands of wallets. Keep the last exact result in
+  // memory. Repository writes invalidate it directly, while SQLite's
+  // data_version catches changes committed by a separate maintenance process.
+  private walletIndexFunnelCountsCache:
+    | {
+        readonly dataVersion: number;
+        readonly counts: WalletIndexFunnelCounts;
+      }
+    | undefined;
   // Snapshot rows are immutable, and this is the expensive half of coverage.
   // Queue counts remain live on every call because their horizon classification
   // depends on the caller's time. Repository writes invalidate this aggregate.
@@ -3103,7 +3114,10 @@ export class Repository implements ManagedRecoveryPreflightRepository {
       }
       return changed;
     })();
-    if (changed) this.invalidateWalletPreScreenSurvivorCache();
+    if (changed) {
+      this.invalidateWalletPreScreenSurvivorCache();
+      this.walletIndexFunnelCountsCache = undefined;
+    }
   }
 
   upsertWalletIndexRecord(record: WalletIndexRecord): void {
@@ -3189,6 +3203,10 @@ export class Repository implements ManagedRecoveryPreflightRepository {
   }
 
   walletIndexFunnelCounts(): WalletIndexFunnelCounts {
+    const dataVersion = this.db.pragma("data_version", { simple: true }) as number;
+    if (this.walletIndexFunnelCountsCache?.dataVersion === dataVersion) {
+      return this.walletIndexFunnelCountsCache.counts;
+    }
     const aggregate = this.db.prepare(`
       SELECT
         COUNT(*) AS indexed,
@@ -3230,7 +3248,7 @@ export class Repository implements ManagedRecoveryPreflightRepository {
     const activityScreened = (this.db.prepare(`
       SELECT COUNT(DISTINCT wallet) AS count FROM wallet_prescreen_snapshots
     `).get() as { count: number }).count;
-    return {
+    const counts = {
       indexed: aggregate.indexed,
       coarseSignerCandidates: aggregate.coarse_signer_candidates,
       exactSwapWallets: aggregate.exact_swap_wallets,
@@ -3239,6 +3257,8 @@ export class Repository implements ManagedRecoveryPreflightRepository {
       closedSwaps: aggregate.closed_swaps,
       holdingTime: aggregate.holding_time
     };
+    this.walletIndexFunnelCountsCache = { dataVersion, counts };
+    return counts;
   }
 
   /**
@@ -5016,7 +5036,10 @@ export class Repository implements ManagedRecoveryPreflightRepository {
       encode(snapshot.reasons),
       encode(snapshot)
     ).changes > 0;
-    if (changed) this.invalidateWalletPreScreenSurvivorCache();
+    if (changed) {
+      this.invalidateWalletPreScreenSurvivorCache();
+      this.walletIndexFunnelCountsCache = undefined;
+    }
   }
 
   commitWalletPreScreen(sample: WalletActivitySample, snapshot: WalletPreScreenSnapshot): void {

@@ -23,7 +23,8 @@ import {
   StockPaperEngine,
   stockAssetAllowsFractionalPhase,
   stockAssetSupportsPhase,
-  stockPaperOvernightFeedMinutesRemaining
+  stockPaperOvernightFeedMinutesRemaining,
+  stockPaperSellEvidenceTimeoutAt
 } from "../src/stock-paper.js";
 import { StockPaperRepository } from "../src/stock-paper-repository.js";
 
@@ -2499,6 +2500,21 @@ describe("StockPaperEngine", () => {
       .toBeUndefined();
   });
 
+  it("keeps one finite PREMARKET liquidation alive through the free-feed evidence gap", () => {
+    expect(stockPaperSellEvidenceTimeoutAt(
+      "2026-07-17T08:00:00.000Z", // 4:00 AM ET
+      "PREMARKET"
+    )).toBe("2026-07-17T12:09:00.000Z");
+    expect(stockPaperSellEvidenceTimeoutAt(
+      "2026-07-17T12:10:00.000Z", // 8:10 AM ET
+      "PREMARKET"
+    )).toBe("2026-07-17T12:19:00.000Z");
+    expect(stockPaperSellEvidenceTimeoutAt(
+      "2026-07-17T01:20:00.000Z",
+      "OVERNIGHT"
+    )).toBe("2026-07-17T01:45:00.000Z");
+  });
+
   it("cancels an unfilled overnight BUY after the entry cutoff", async () => {
     db = openDatabase(":memory:");
     const repository = new StockPaperRepository(db);
@@ -2668,10 +2684,10 @@ describe("StockPaperEngine", () => {
     });
   });
 
-  it("arms a real-evidence SESSION_END liquidation before BOATS closes", async () => {
+  it("arms a real-evidence SESSION_END liquidation early enough for delayed BOATS confirmation", async () => {
     db = openDatabase(":memory:");
     const repository = new StockPaperRepository(db);
-    const now = new Date("2026-07-17T07:50:00.000Z"); // 3:50 AM ET
+    const now = new Date("2026-07-17T07:25:00.000Z"); // 3:25 AM ET
     const lane = repository.ensureActiveLane("2026-07-17T06:00:00.000Z");
     const account = repository.account(lane.id)!;
     const position: StockPaperPosition = {
@@ -2694,7 +2710,7 @@ describe("StockPaperEngine", () => {
       takeProfitPriceUsd: 112,
       scoreAtEntry: 82,
       openedAt: "2026-07-17T06:00:00.000Z",
-      updatedAt: "2026-07-17T07:49:00.000Z"
+      updatedAt: "2026-07-17T07:24:00.000Z"
     };
     repository.commitCycle({
       account: {
@@ -2740,7 +2756,7 @@ describe("StockPaperEngine", () => {
       async getBars(input: { symbols: readonly string[] }): Promise<AlpacaBarsResult> {
         return { bars: new Map(input.symbols.map((symbol) => [
           symbol,
-          symbol === "AAPL" ? entryBars("2026-07-17T07:34:00.000Z") : []
+          symbol === "AAPL" ? entryBars("2026-07-17T07:09:00.000Z") : []
         ])) };
       }
     } as unknown as AlpacaPaperProvider;

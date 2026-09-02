@@ -1,5 +1,21 @@
 import type { Repository } from "./repository.js";
 
+export const MAXIMUM_SOL_PRICE_COVERAGE_GAP_SECONDS = 10 * 60;
+
+/**
+ * Historical observations are captured after a network response, so an otherwise
+ * exact ten-minute cadence can differ by a few milliseconds from one request to
+ * the next. Keep the exact measured gap in telemetry, but ignore only subsecond
+ * capture jitter when applying the ten-minute continuity gate. A full additional
+ * second still fails closed.
+ */
+export function isSolPriceCoverageGapAcceptable(largestGapSeconds: number | undefined): boolean {
+  if (largestGapSeconds === undefined) return true;
+  return Number.isFinite(largestGapSeconds) &&
+    largestGapSeconds >= 0 &&
+    largestGapSeconds < MAXIMUM_SOL_PRICE_COVERAGE_GAP_SECONDS + 1;
+}
+
 export interface SolPriceSnapshot {
   capturedAt: string;
   priceUsd: number;
@@ -36,6 +52,7 @@ export class LocalSolPriceOracle {
     outOfHorizonSwapReprices: number;
     oldestAt?: string;
     newestAt?: string;
+    largestGapSeconds: number;
   } {
     return this.repository.solPriceCoverage();
   }

@@ -72,6 +72,64 @@ const STOCK_SHADOW_POLICY_BY_ID = new Map(
 );
 const STOCK_SHADOW_POLICY_SET_DIGEST = stockPaperShadowPolicySetDigestV3();
 
+// These are display projections only. The complete append-only evidence stays
+// in SQLite and continues to feed all accounting, learning, and risk logic.
+// Keeping the frequently refreshed dashboard bounded avoids repeatedly
+// serializing hundreds of large replay/order records as the PAPER run grows.
+const STOCK_PAPER_DASHBOARD_SIGNAL_LIMIT = 30;
+const STOCK_PAPER_DASHBOARD_TRADE_LIMIT = 12;
+const STOCK_PAPER_DASHBOARD_ORDER_LIMIT = 12;
+const STOCK_PAPER_DASHBOARD_EQUITY_SOURCE_LIMIT = 720;
+const STOCK_PAPER_DASHBOARD_EQUITY_POINT_LIMIT = 240;
+const STOCK_PAPER_OUTCOME_PROJECTION_CACHE_TTL_MS = 60_000;
+
+interface StockPaperOutcomeProjection {
+  totalObservations: number;
+  totalOutcomes: number;
+  labeledOutcomes: number;
+  missingOutcomes: number;
+  quality: StockPaperOutcomeQualitySummary[];
+}
+
+function downsampleDashboardEquity(
+  points: StockPaperEquityPoint[],
+  limit = STOCK_PAPER_DASHBOARD_EQUITY_POINT_LIMIT
+): StockPaperEquityPoint[] {
+  if (points.length <= limit || limit < 2) return points;
+
+  // Preserve both endpoints and the account-wide extrema, then distribute the
+  // remaining display points evenly over the same source horizon. This keeps
+  // the ALL/YTD views honest without shipping every minute-level row.
+  const selected = new Set<number>([0, points.length - 1]);
+  const extrema = [
+    (left: StockPaperEquityPoint, right: StockPaperEquityPoint) => left.navUsd - right.navUsd,
+    (left: StockPaperEquityPoint, right: StockPaperEquityPoint) => right.navUsd - left.navUsd,
+    (left: StockPaperEquityPoint, right: StockPaperEquityPoint) =>
+      right.drawdownPercent - left.drawdownPercent
+  ];
+  for (const compare of extrema) {
+    let best = 0;
+    for (let index = 1; index < points.length; index += 1) {
+      if (compare(points[index]!, points[best]!) > 0) best = index;
+    }
+    selected.add(best);
+  }
+  const evenlySpacedSlots = Math.max(1, limit - selected.size);
+  for (let slot = 1; slot <= evenlySpacedSlots && selected.size < limit; slot += 1) {
+    selected.add(Math.round(slot * (points.length - 1) / (evenlySpacedSlots + 1)));
+  }
+  // Rounding can collide with an already-preserved extreme. Fill any remaining
+  // slots deterministically rather than returning a surprisingly sparse chart.
+  if (selected.size < limit) {
+    for (let index = 1; index < points.length - 1 && selected.size < limit; index += 1) {
+      selected.add(index);
+    }
+  }
+  return [...selected]
+    .sort((left, right) => left - right)
+    .map((index) => points[index]!);
+}
+
 function parseJson<T>(value: string): T {
   return JSON.parse(value) as T;
 }
@@ -275,6 +333,10 @@ export interface StockPaperRotationAnalysisCommit {
 }
 
 export class StockPaperRepository {
+  private outcomeProjectionCache:
+    | { readonly laneId: string; readonly expiresAt: number; readonly value: StockPaperOutcomeProjection }
+    | undefined;
+
   constructor(private readonly db: CopyLabDatabase) {}
 
   activeLane(): StockPaperLane | undefined {
@@ -1037,13 +1099,9 @@ export class StockPaperRepository {
     return summary;
   }
 
-  private outcomeQualityProjection(laneId: string, now = new Date()): {
-    totalObservations: number;
-    totalOutcomes: number;
-    labeledOutcomes: number;
-    missingOutcomes: number;
-    quality: StockPaperOutcomeQualitySummary[];
-  } {
+  private outcomeQualityProjection(laneId: string, now = new Date()): StockPaperOutcomeProjection {
+    const cached = this.outcomeProjectionCache;
+    if (cached?.laneId === laneId && Date.now() < cached.expiresAt) return cached.value;
     type OutcomeRow = {
       observation_id: string;
       observed_at: string;
@@ -1172,7 +1230,7 @@ export class StockPaperRepository {
     }
     finalizeObservation();
 
-    return {
+    const value = {
       totalObservations,
       totalOutcomes,
       labeledOutcomes,
@@ -1214,7 +1272,13 @@ export class StockPaperRepository {
           })
         };
       })
+    } satisfies StockPaperOutcomeProjection;
+    this.outcomeProjectionCache = {
+      laneId,
+      expiresAt: Date.now() + STOCK_PAPER_OUTCOME_PROJECTION_CACHE_TTL_MS,
+      value
     };
+    return value;
   }
 
   private latestShadowScores(laneId: string): StockPaperShadowPolicyScore[] {
@@ -1414,6 +1478,7 @@ export class StockPaperRepository {
 
   commitCycle(input: StockPaperCycleCommit): void {
     const laneId = input.account.laneId;
+    let outcomeProjectionChanged = false;
     const upsertPosition = this.db.prepare(`
       INSERT INTO stock_paper_positions(
         id, lane_id, symbol, arm, status, position_json, updated_at
@@ -1609,6 +1674,7 @@ export class StockPaperRepository {
           observation.policyVersion,
           observationJson
         );
+        outcomeProjectionChanged = true;
       }
       for (const outcome of input.outcomes ?? []) {
         if (outcome.laneId !== laneId) {
@@ -1638,6 +1704,7 @@ export class StockPaperRepository {
           outcome.labeledAt,
           outcomeJson
         );
+        outcomeProjectionChanged = true;
       }
       for (const result of input.shadowResults ?? []) {
         insertShadowResult.run(
@@ -1696,11 +1763,12 @@ export class StockPaperRepository {
         30,
         Math.round(this.activeLane()?.policy.observationRetentionDays ?? 180)
       );
-      this.db.prepare(`
+      const deletedObservations = this.db.prepare(`
         DELETE FROM stock_paper_observations
         WHERE lane_id = ?
           AND observed_at < strftime('%Y-%m-%dT%H:%M:%fZ', ?, ?)
       `).run(laneId, input.equityPoint.capturedAt, `-${retentionDays} days`);
+      if (deletedObservations.changes > 0) outcomeProjectionChanged = true;
       this.db.prepare(`
         DELETE FROM stock_paper_news_evidence
         WHERE lane_id = ?
@@ -1717,6 +1785,7 @@ export class StockPaperRepository {
           AND captured_at < strftime('%Y-%m-%dT%H:%M:%fZ', ?, ?)
       `).run(laneId, input.equityPoint.capturedAt, `-${retentionDays} days`);
     })();
+    if (outcomeProjectionChanged) this.outcomeProjectionCache = undefined;
   }
 
   commitLearningEvaluation(input: StockPaperLearningCommit): void {
@@ -1946,12 +2015,14 @@ export class StockPaperRepository {
           ? { ...candidate, sparklinePricesUsd }
           : candidate;
       }),
-      recentSignals: this.signals(lane.id, 80),
-      recentTrades: this.trades(lane.id, 80),
-      equityCurve: this.equity(lane.id, 720),
+      recentSignals: this.signals(lane.id, STOCK_PAPER_DASHBOARD_SIGNAL_LIMIT),
+      recentTrades: this.trades(lane.id, STOCK_PAPER_DASHBOARD_TRADE_LIMIT),
+      equityCurve: downsampleDashboardEquity(
+        this.equity(lane.id, STOCK_PAPER_DASHBOARD_EQUITY_SOURCE_LIMIT)
+      ),
       capitalEvents: this.capitalEvents(lane.id, 20),
       armStats: this.armStats(lane.id, this.marketStatus(lane.id).phase),
-      orders: this.orders(lane.id, 100),
+      orders: this.orders(lane.id, STOCK_PAPER_DASHBOARD_ORDER_LIMIT),
       learning: this.learningDashboard(lane.id),
       market: this.marketStatus(lane.id),
       updatedAt

@@ -189,7 +189,7 @@ describe("TradingRuntime recovery controls", () => {
     }
   });
 
-  it("configures while quiesced and starts only the newly selected provider worker on resume", async () => {
+  it("refreshes credential and profile transitions while quiesced and resumes only the selected worker", async () => {
     const { repository } = setup();
     repository.setSetting("mode", "PAPER");
     let oldStops = 0;
@@ -197,6 +197,8 @@ describe("TradingRuntime recovery controls", () => {
     let newStops = 0;
     let subscriptions = 0;
     let discoveries = 0;
+    const bootstrapRefreshes: string[] = [];
+    const transitionHealthRefreshes: Array<{ force: boolean; allowQuiesced: boolean }> = [];
     const oldIndexer = {
       start: () => undefined,
       stop: async () => { oldStops += 1; }
@@ -208,17 +210,30 @@ describe("TradingRuntime recovery controls", () => {
     const harness = runtime! as unknown as {
       walletIndexer?: { start(): void; stop(): Promise<void> };
       configureProviders(): Promise<void>;
-      recreateSolPriceBootstrapClient(): Promise<void>;
+      recreateSolPriceBootstrapClient(change?: "credentials" | "profile"): Promise<void>;
       refreshActiveRpcReadiness(): Promise<void>;
-      refreshHealth(force: boolean): Promise<void>;
+      refreshHealth(
+        force: boolean,
+        options?: { allowQuiescedMarketHealth?: boolean }
+      ): Promise<void>;
       subscribeActiveWallets(generation?: number): Promise<void>;
       refreshDiscoveryIfDue(generation?: number): Promise<void>;
     };
     harness.walletIndexer = oldIndexer;
     harness.configureProviders = async () => { harness.walletIndexer = newIndexer; };
-    harness.recreateSolPriceBootstrapClient = async () => undefined;
+    harness.recreateSolPriceBootstrapClient = async (change = "credentials") => {
+      bootstrapRefreshes.push(change);
+    };
     harness.refreshActiveRpcReadiness = async () => undefined;
-    harness.refreshHealth = async () => undefined;
+    harness.refreshHealth = async (force, options) => {
+      transitionHealthRefreshes.push({
+        force,
+        allowQuiesced: options?.allowQuiescedMarketHealth === true
+      });
+      if (!options?.allowQuiescedMarketHealth) {
+        throw new Error("Transition health was not explicitly authorized while quiesced.");
+      }
+    };
     harness.subscribeActiveWallets = async () => { subscriptions += 1; };
     harness.refreshDiscoveryIfDue = async () => { discoveries += 1; };
 
@@ -235,6 +250,115 @@ describe("TradingRuntime recovery controls", () => {
     expect(subscriptions).toBe(1);
     expect(discoveries).toBe(1);
     expect(newStops).toBe(0);
+
+    await runtime!.quiesceProviderWork();
+    await runtime!.dataProviderProfileChanged();
+    expect(newStarts).toBe(1);
+    expect(newStops).toBe(1);
+
+    await runtime!.resumeProviderWork();
+    await Promise.resolve();
+    expect(newStarts).toBe(2);
+    expect(subscriptions).toBe(2);
+    expect(discoveries).toBe(2);
+    expect(bootstrapRefreshes).toEqual(["credentials", "profile"]);
+    expect(transitionHealthRefreshes).toEqual([
+      { force: true, allowQuiesced: true },
+      { force: true, allowQuiesced: true }
+    ]);
+  });
+
+  it("recovers the current owner after a repeated provider-drain timeout", async () => {
+    setup();
+    vi.useFakeTimers();
+    let releaseStop!: () => void;
+    const stopGate = new Promise<void>((resolve) => { releaseStop = resolve; });
+    const start = vi.fn();
+    const harness = runtime! as unknown as {
+      walletIndexer?: { start(): void; stop(): Promise<void> };
+      providerWorkQuiesced: boolean;
+    };
+    harness.walletIndexer = { start, stop: () => stopGate };
+
+    const first = runtime!.quiesceProviderWork();
+    const firstRejection = expect(first).rejects.toThrow("did not quiesce within 30 seconds");
+    await vi.advanceTimersByTimeAsync(30_000);
+    await firstRejection;
+    expect(harness.providerWorkQuiesced).toBe(true);
+
+    const second = runtime!.quiesceProviderWork();
+    const secondRejection = expect(second).rejects.toThrow("did not quiesce within 30 seconds");
+    await vi.advanceTimersByTimeAsync(30_000);
+    await secondRejection;
+    expect(harness.providerWorkQuiesced).toBe(true);
+
+    releaseStop();
+    await vi.waitFor(() => expect(harness.providerWorkQuiesced).toBe(false));
+    expect(start).not.toHaveBeenCalled();
+  });
+
+  it("drains and discards a full provider-health cycle superseded by quiescence", async () => {
+    const { repository } = setup();
+    const prior = {
+      provider: "helius" as const,
+      ok: true,
+      checkedAt: "2026-07-10T00:00:00.000Z",
+      message: "prior committed health"
+    };
+    repository.setProviderHealth(prior);
+    let releaseChain!: () => void;
+    const chainGate = new Promise<void>((resolve) => { releaseChain = resolve; });
+    const oldStreamStatus = vi.fn(() => ({ active: false, connected: false, ready: false }));
+    const newStreamStatus = vi.fn(() => ({ active: false, connected: false, ready: false }));
+    const harness = runtime! as unknown as {
+      providers: unknown;
+      lastAutonomousMarketHealth: unknown;
+      refreshHealth(includeBirdeye: boolean): Promise<void>;
+    };
+    harness.lastAutonomousMarketHealth = {
+      provider: "jupiter",
+      ok: true,
+      checkedAt: new Date().toISOString(),
+      message: "fresh cached market health"
+    };
+    harness.providers = {
+      chain: {
+        checkHealth: async () => {
+          await chainGate;
+          return {
+            provider: "helius" as const,
+            ok: false,
+            checkedAt: new Date().toISOString(),
+            message: "superseded provider health"
+          };
+        },
+        getStreamStatus: oldStreamStatus,
+        getStreamHealth: vi.fn()
+      },
+      token: { checkHealth: async () => ({ provider: "jupiter" as const, ok: true, checkedAt: new Date().toISOString(), message: "token" }) },
+      swap: { checkHealth: async () => ({ provider: "jupiter" as const, ok: true, checkedAt: new Date().toISOString(), message: "swap" }) },
+      market: { checkHealth: vi.fn() },
+      discovery: { checkHealth: vi.fn() }
+    };
+
+    const refresh = harness.refreshHealth(false);
+    const refreshRejection = expect(refresh).rejects.toThrow("Provider-owned work was superseded");
+    await Promise.resolve();
+    const quiescing = runtime!.quiesceProviderWork();
+    harness.providers = {
+      chain: { getStreamStatus: newStreamStatus }
+    };
+    let quiesced = false;
+    void quiescing.then(() => { quiesced = true; });
+    await Promise.resolve();
+    expect(quiesced).toBe(false);
+
+    releaseChain();
+    await refreshRejection;
+    await quiescing;
+    expect(repository.listProviderHealth()).toEqual([prior]);
+    expect(oldStreamStatus).not.toHaveBeenCalled();
+    expect(newStreamStatus).not.toHaveBeenCalled();
   });
 
   it("keeps a failed startup repair cursor durable and retries it safely after restart", async () => {
@@ -329,6 +453,28 @@ describe("TradingRuntime recovery controls", () => {
       "SELECT COUNT(*) AS count FROM source_events WHERE signature = ? AND wallet = ?"
     ).get(recovered.sourceSignature, address)).toEqual({ count: 1 });
     expect(repository.listUnprocessedSourceEvents()).toEqual([]);
+  });
+
+  it("replaces a stale automatic local-data label when a fresh repair cycle starts without dropping hard holds", () => {
+    const { repository } = setup();
+    repository.setSetting("operational_pause_state", {
+      active: true,
+      reasons: ["BALANCE_MISMATCH", "LOCAL_DATA_UNHEALTHY"],
+      recovery: "MANUAL_REVIEW",
+      pausedAt: "2026-07-09T23:00:00.000Z",
+      lastEvaluatedAt: "2026-07-09T23:30:00.000Z"
+    });
+    const harness = runtime! as unknown as {
+      pauseForMonitoringRepair(addresses: readonly string[]): void;
+    };
+
+    harness.pauseForMonitoringRepair(["restart-wallet"]);
+
+    expect(runtime!.operationalPauseState()).toMatchObject({
+      active: true,
+      reasons: ["BALANCE_MISMATCH", "HISTORY_GAP_REPAIR"],
+      recovery: "MANUAL_REVIEW"
+    });
   });
 
   it("automatically retries a failed repair before starting the wallet stream", async () => {
@@ -732,6 +878,73 @@ describe("TradingRuntime recovery controls", () => {
   );
 
   it.runIf(process.platform === "win32")(
+    "rebuilds the real SOL history provider when a profile transition removes and restores managed fallback",
+    async () => {
+      db = openDatabase(":memory:");
+      const repository = new Repository(db);
+      const vault = new SecretVault(repository);
+      const wallet = new WalletManager(vault, repository);
+      const modes = new ModeManager(repository, wallet);
+      vault.setCredentials({
+        birdeyeApiKey: "managed-birdeye-key",
+        heliusApiKey: "helius-key",
+        jupiterApiKey: "jupiter-key"
+      });
+      runtime = new TradingRuntime(
+        repository,
+        vault,
+        modes,
+        new EventBus(),
+        new DpapiTransactionSigner(vault, repository)
+      );
+      const harness = runtime as unknown as {
+        configureProviders(): Promise<void>;
+        refreshActiveRpcReadiness(): Promise<void>;
+        refreshHealth(
+          force: boolean,
+          options?: { allowQuiescedMarketHealth?: boolean }
+        ): Promise<void>;
+      };
+      harness.configureProviders = async () => undefined;
+      harness.refreshActiveRpcReadiness = async () => undefined;
+      harness.refreshHealth = async () => undefined;
+
+      expect(runtime.solPriceBootstrapStatus()).toMatchObject({
+        authenticationConfigured: true,
+        pythAuthenticationConfigured: false,
+        managedFallbackConfigured: true,
+        activeSource: "birdeye_ohlcv_v3"
+      });
+
+      await runtime.quiesceProviderWork();
+      vault.setDataProviderProfile({
+        mode: "SELF_HOSTED",
+        solanaHttpUrl: "http://127.0.0.1:8899",
+        solanaWsUrl: "ws://127.0.0.1:8900"
+      });
+      await runtime.dataProviderProfileChanged();
+      expect(runtime.solPriceBootstrapStatus()).toMatchObject({
+        authenticationConfigured: false,
+        pythAuthenticationConfigured: false,
+        managedFallbackConfigured: false,
+        activeSource: PYTH_SOL_USD_HISTORY_SOURCE
+      });
+      await runtime.resumeProviderWork();
+
+      await runtime.quiesceProviderWork();
+      vault.setDataProviderProfile({ mode: "MANAGED" });
+      await runtime.dataProviderProfileChanged();
+      expect(runtime.solPriceBootstrapStatus()).toMatchObject({
+        authenticationConfigured: true,
+        pythAuthenticationConfigured: false,
+        managedFallbackConfigured: true,
+        activeSource: "birdeye_ohlcv_v3"
+      });
+      await runtime.resumeProviderWork();
+    }
+  );
+
+  it.runIf(process.platform === "win32")(
     "recreates the dormant Pyth worker from the encrypted credential after a key change",
     async () => {
       db = openDatabase(":memory:");
@@ -985,6 +1198,49 @@ describe("TradingRuntime recovery controls", () => {
         ]),
         tradingHead: { healthy: true }
       });
+      await harness.evaluateStops();
+      expect(runtime!.operationalPauseState()).toMatchObject({ active: false, reasons: [] });
+
+      const repairingWallet = wallets[0]!;
+      const checkpoint = repository.getMonitoringRepairCheckpoint(repairingWallet)!;
+      const attemptAt = "2026-07-10T11:59:40.000Z";
+      expect(repository.startMonitoringRepair(repairingWallet, checkpoint.cursorAt, attemptAt)).toBe(true);
+      expect(repository.failMonitoringRepair(
+        repairingWallet,
+        checkpoint.cursorAt,
+        "2026-07-10T12:01:00.000Z",
+        "bounded startup repair retry",
+        "2026-07-10T11:59:45.000Z"
+      )).toBe(true);
+      connected = false;
+      expect(runtime!.operationalTelemetry()).toMatchObject({
+        blocksNewEntries: true,
+        blockingIssueCodes: expect.arrayContaining([
+          "MONITORING_REPAIR_FAILED",
+          "MONITORING_STREAM_UNHEALTHY"
+        ]),
+        tradingHead: { healthy: false }
+      });
+      await harness.evaluateStops();
+      expect(runtime!.operationalPauseState()).toMatchObject({
+        active: true,
+        reasons: ["HISTORY_GAP_REPAIR"]
+      });
+
+      expect(repository.startMonitoringRepair(repairingWallet, checkpoint.cursorAt, attemptAt)).toBe(true);
+      expect(repository.completeMonitoringRepair(
+        repairingWallet,
+        checkpoint.cursorAt,
+        "2026-07-10T11:59:50.000Z",
+        "2026-07-10T11:59:50.000Z"
+      )).toBe(true);
+      await harness.evaluateStops();
+      expect(runtime!.operationalPauseState()).toMatchObject({
+        active: true,
+        reasons: ["HISTORY_GAP_REPAIR"]
+      });
+
+      connected = true;
       await harness.evaluateStops();
       expect(runtime!.operationalPauseState()).toMatchObject({ active: false, reasons: [] });
 

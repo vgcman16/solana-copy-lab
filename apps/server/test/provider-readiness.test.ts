@@ -610,6 +610,28 @@ describe("provider readiness", () => {
     expect(result.blockers).toContain("local SOL/USD price history contains a gap longer than ten minutes");
   });
 
+  it("does not mistake subsecond price-capture jitter for a missing ten-minute interval", () => {
+    const result = calculateProviderReadiness({
+      ...proofContext(),
+      profile: {
+        mode: "SHADOW",
+        configured: true,
+        httpOrigin: "http://127.0.0.1:8899",
+        wsOrigin: "ws://127.0.0.1:8900"
+      },
+      priceCoverage: {
+        count: 30_000,
+        oldestAt: "2026-04-01T00:00:00.000Z",
+        newestAt: "2026-07-10T11:58:00.000Z",
+        largestGapSeconds: 600.048
+      },
+      observations: [],
+      now: NOW
+    });
+
+    expect(result.blockers).not.toContain("local SOL/USD price history contains a gap longer than ten minutes");
+  });
+
   it("rejects nominal price coverage while SOL-legged swaps remain unpriced", () => {
     const result = calculateProviderReadiness({
       ...proofContext(),

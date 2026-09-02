@@ -122,4 +122,37 @@ describe("current isolated stock paper ledger", () => {
     });
     expect(db.pragma("foreign_key_check")).toEqual([]);
   });
+
+  it("keeps the equity dashboard projection bounded without shortening its source horizon", () => {
+    db = openDatabase(":memory:");
+    const repository = new StockPaperRepository(db);
+    const startedAt = "2026-01-01T00:00:00.000Z";
+    const lane = repository.ensureActiveLane(startedAt);
+    const insert = db.prepare(`
+      INSERT INTO stock_paper_equity_points(lane_id, captured_at, point_json)
+      VALUES (?, ?, ?)
+    `);
+    db.transaction(() => {
+      for (let index = 0; index < 720; index += 1) {
+        const capturedAt = new Date(Date.parse(startedAt) + index * 60_000).toISOString();
+        insert.run(lane.id, capturedAt, JSON.stringify({
+          capturedAt,
+          navUsd: index === 411 ? 750 : 1_000 + index / 10,
+          cashUsd: 1_000,
+          deployedUsd: 0,
+          drawdownPercent: index === 411 ? 25 : 0
+        }));
+      }
+    })();
+
+    const curve = repository.dashboard().equityCurve;
+    expect(curve).toHaveLength(240);
+    expect(curve[0]?.capturedAt).toBe(startedAt);
+    expect(curve.at(-1)?.capturedAt).toBe(
+      new Date(Date.parse(startedAt) + 719 * 60_000).toISOString()
+    );
+    expect(curve.some((point) => point.drawdownPercent === 25 && point.navUsd === 750)).toBe(true);
+    expect(curve.every((point, index) => index === 0 || point.capturedAt > curve[index - 1]!.capturedAt))
+      .toBe(true);
+  });
 });

@@ -966,6 +966,16 @@ describe("Repository", () => {
       updatedAt
     }));
     repository.upsertWalletIndexRecords(records);
+    const initialFunnel = repository.walletIndexFunnelCounts();
+    expect(initialFunnel).toMatchObject({
+      indexed: 5_000,
+      exactSwapWallets: 5_000,
+      activityScreened: 0,
+      activityProven: 2_500,
+      closedSwaps: 2_500,
+      holdingTime: 2_500
+    });
+    expect(repository.walletIndexFunnelCounts()).toBe(initialFunnel);
     expect(repository.listWalletIndexRecords(10_000)).toHaveLength(5_000);
     expect(repository.listWalletIndexRecords(10_000, true)).toHaveLength(2_500);
     expect(repository.listWalletIndexResearchShortlist(3).map((record) => record.wallet)).toEqual([
@@ -997,6 +1007,10 @@ describe("Repository", () => {
       reasons: [],
       record: first
     });
+    const refreshedFunnel = repository.walletIndexFunnelCounts();
+    expect(refreshedFunnel).not.toBe(initialFunnel);
+    expect(refreshedFunnel.activityScreened).toBe(1);
+    expect(repository.walletIndexFunnelCounts()).toBe(refreshedFunnel);
     repository.saveWalletIndexCheckpoint({
       pipeline: "program-backfill",
       partition: "jupiter-v6",
