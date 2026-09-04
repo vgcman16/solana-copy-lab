@@ -1,5 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
-import { HeliusObserver, type WebSocketLike } from "../src/helius.js";
+import {
+  HeliusObserver,
+  HeliusWebSocketConnectionInterruptedError,
+  type WebSocketLike
+} from "../src/helius.js";
 import { flushPromises, jsonResponse, mockFetch } from "./helpers.js";
 import {
   PUBLIC_SWAP_SIGNATURE,
@@ -168,6 +172,7 @@ describe("HeliusObserver", () => {
       expect(observer.getStreamStatus().ready).toBe(true);
 
       sockets[0]?.error();
+      expect(errors[0]).toBeInstanceOf(HeliusWebSocketConnectionInterruptedError);
       expect(errors.map((error) => error.message)).toEqual([
         "Helius WebSocket reported a connection error"
       ]);

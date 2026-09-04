@@ -76,7 +76,7 @@ export class JupiterQuoteError extends Error {
   }
 }
 
-export function isJupiterNoRouteError(error: unknown): boolean {
+export function isJupiterNoRouteError(error: unknown): error is JupiterQuoteError {
   return error instanceof JupiterQuoteError && error.code === JUPITER_NO_ROUTES_ERROR_CODE;
 }
 

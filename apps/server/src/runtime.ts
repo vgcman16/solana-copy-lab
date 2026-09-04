@@ -25,6 +25,7 @@ import {
   decodeSpotSwapTransaction,
   HeliusRpcClient,
   HeliusObserver,
+  HeliusWebSocketConnectionInterruptedError,
   JupiterMarketDataProvider,
   JupiterSwapProvider,
   JupiterTokenRiskProvider,
@@ -533,7 +534,7 @@ export class TradingRuntime implements RuntimeController {
         this.events.publish("research-paper", data);
         this.marketplaceMirror.afterPerformanceUpdate("research_paper");
       },
-      onError: (error) => this.recordError("research_paper", error)
+      onError: (error) => this.recordProviderWorkError("research_paper", error)
     });
     this.learningDatabase = options.learningDatabase ?? openLearningDatabase(":memory:");
     this.ownsLearningDatabase = options.learningDatabase === undefined;
@@ -548,7 +549,7 @@ export class TradingRuntime implements RuntimeController {
         walletConfirmed: (mint, capturedAt) =>
           this.repository.hasRecentWalletConfirmedMint(mint, capturedAt),
         onUpdate: (data) => this.events.publish("autonomous-learning", data),
-        onError: (error) => this.recordError("autonomous_learning", error)
+        onError: (error) => this.recordProviderWorkError("autonomous_learning", error)
       }
     );
     this.autonomousPaper = new AutonomousPaperEngine(repository, {
@@ -574,7 +575,7 @@ export class TradingRuntime implements RuntimeController {
         this.events.publish("autonomous-paper", data);
         this.marketplaceMirror.afterPerformanceUpdate("autonomous_paper");
       },
-      onError: (error) => this.recordError("autonomous_paper", error)
+      onError: (error) => this.recordProviderWorkError("autonomous_paper", error)
     });
     this.stockPaper = new StockPaperEngine(
       new StockPaperRepository(repository.db),
@@ -2399,7 +2400,7 @@ export class TradingRuntime implements RuntimeController {
         // repair cannot burst past the managed free-tier allowance.
         requestsPerSecond: 1,
         fetch: managedFetch!,
-        onError: (error) => this.recordError("helius_stream", error),
+        onError: (error) => this.recordHeliusStreamIssue("helius_stream", error),
         onRequest: ({ credits }) => this.reserveHeliusProviderCredits(credits),
         onRejectedSwap: (rejection) => this.queueProviderRejectedSwap(rejection)
       });
@@ -2409,7 +2410,7 @@ export class TradingRuntime implements RuntimeController {
       researchChain = new HeliusObserver(managed.heliusApiKey, {
         requestsPerSecond: 0.5,
         fetch: managedFetch!,
-        onError: (error) => this.recordError("research_helius_stream", error),
+        onError: (error) => this.recordHeliusStreamIssue("research_helius_stream", error),
         onRequest: ({ credits }) => this.reserveHeliusProviderCredits(credits),
         onRejectedSwap: (rejection) => this.queueResearchProviderRejectedSwap(rejection),
         onTokenDecrease: (observation) => this.queueResearchTokenDecrease(observation)
@@ -5214,5 +5215,23 @@ export class TradingRuntime implements RuntimeController {
     const message = this.errorText(error);
     this.repository.audit(event, message, details, "warning");
     this.events.publish("runtime-error", { event, message, ...details });
+  }
+
+  private recordHeliusStreamIssue(event: string, error: Error): void {
+    if (error instanceof HeliusWebSocketConnectionInterruptedError) {
+      // Helius documents idle/transient WebSocket disconnects as recoverable.
+      // The observer still becomes unhealthy immediately, reconnects with
+      // bounded backoff, and repairs the complete gap before readiness. Keep
+      // the transport transition in the audit trail without making a recovered
+      // interruption hold the whole dashboard in warning for 24 hours. A
+      // sustained outage is independently surfaced by the operational pause,
+      // while acknowledgement/liveness/repair failures still use recordError.
+      this.repository.audit(event, this.errorText(error), {
+        recovery: "RECONNECT_AND_GAP_REPAIR",
+        failClosed: true
+      });
+      return;
+    }
+    this.recordError(event, error);
   }
 }

@@ -43,7 +43,7 @@ describe("schema v46 autonomous dashboard indexes", () => {
     legacy.close();
 
     db = openDatabase(path);
-    expect(COPYLAB_SCHEMA_VERSION).toBe(47);
+    expect(COPYLAB_SCHEMA_VERSION).toBe(48);
     expect(db.pragma("user_version", { simple: true })).toBe(COPYLAB_SCHEMA_VERSION);
     expect(db.prepare("SELECT value_json FROM settings WHERE key = 'v46-marker'").get())
       .toEqual({ value_json: '"preserved"' });

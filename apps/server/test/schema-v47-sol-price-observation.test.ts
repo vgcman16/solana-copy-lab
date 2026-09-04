@@ -50,7 +50,7 @@ describe("schema v47 SOL price observation provenance", () => {
     legacy.close();
 
     db = openDatabase(path);
-    expect(COPYLAB_SCHEMA_VERSION).toBe(47);
+    expect(COPYLAB_SCHEMA_VERSION).toBe(48);
     expect(db.pragma("user_version", { simple: true })).toBe(COPYLAB_SCHEMA_VERSION);
     expect((db.pragma("table_info(sol_price_snapshots)") as Array<{
       name: string;
@@ -111,7 +111,7 @@ describe("schema v47 SOL price observation provenance", () => {
 
     db.close();
     db = openDatabase(path);
-    expect(db.pragma("user_version", { simple: true })).toBe(47);
+    expect(db.pragma("user_version", { simple: true })).toBe(48);
     expect(db.prepare("SELECT COUNT(*) AS count FROM sol_price_snapshots").get())
       .toEqual({ count: 3 });
   });
@@ -140,7 +140,7 @@ describe("schema v47 SOL price observation provenance", () => {
     db = undefined;
 
     db = openDatabase(path);
-    expect(db.pragma("user_version", { simple: true })).toBe(47);
+    expect(db.pragma("user_version", { simple: true })).toBe(48);
     expect(db.prepare(`
       SELECT captured_at, observed_at, price_usd, source FROM sol_price_snapshots
     `).get()).toEqual({

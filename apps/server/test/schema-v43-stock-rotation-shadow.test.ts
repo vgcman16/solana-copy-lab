@@ -39,7 +39,7 @@ describe("schema v43 stock PAPER rotation shadow", () => {
 
     db = openDatabase(databasePath);
 
-    expect(COPYLAB_SCHEMA_VERSION).toBe(47);
+    expect(COPYLAB_SCHEMA_VERSION).toBe(48);
     expect(db.pragma("user_version", { simple: true })).toBe(COPYLAB_SCHEMA_VERSION);
     expect(columns(db, "stock_paper_rotation_decisions")).toEqual([
       "id",

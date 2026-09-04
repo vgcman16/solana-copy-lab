@@ -43,6 +43,20 @@ const DEFAULT_LIVENESS_TIMEOUT_MS = 90_000;
 // gets one bounded request window without multiplying quota through retries.
 const DEFAULT_WALLET_HISTORY_TIMEOUT_MS = 30_000;
 
+/**
+ * WHATWG intentionally hides transport details from WebSocket `error` events.
+ * The observer still closes, reconnects, repairs the missed interval, and
+ * remains fail-closed while that happens. Runtime callers can distinguish this
+ * low-information outage transition from an acknowledgement, liveness, repair,
+ * or hydration failure that requires an operator-facing warning.
+ */
+export class HeliusWebSocketConnectionInterruptedError extends Error {
+  constructor() {
+    super("Helius WebSocket reported a connection error");
+    this.name = "HeliusWebSocketConnectionInterruptedError";
+  }
+}
+
 export interface WebSocketLike {
   readonly readyState: number;
   send(data: string): void;
@@ -685,7 +699,7 @@ export class HeliusObserver implements ChainObserver {
       // of writing the same warning on every backoff attempt.
       if (!state.connectionErrorReported) {
         state.connectionErrorReported = true;
-        this.report(new Error("Helius WebSocket reported a connection error"));
+        this.report(new HeliusWebSocketConnectionInterruptedError());
       }
       if (!state.stopped && state.socket === socket) {
         socket.close(CLIENT_STREAM_ERROR_CLOSE_CODE, "connection error");

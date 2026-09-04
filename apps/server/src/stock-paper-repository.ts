@@ -82,6 +82,12 @@ const STOCK_PAPER_DASHBOARD_ORDER_LIMIT = 12;
 const STOCK_PAPER_DASHBOARD_EQUITY_SOURCE_LIMIT = 720;
 const STOCK_PAPER_DASHBOARD_EQUITY_POINT_LIMIT = 240;
 const STOCK_PAPER_OUTCOME_PROJECTION_CACHE_TTL_MS = 60_000;
+export const STOCK_PAPER_LEARNING_EVIDENCE_LIMIT = 20_000;
+
+export interface StockPaperLearningEvidenceSample {
+  observations: StockPaperObservation[];
+  outcomes: StockPaperObservationOutcome[];
+}
 
 interface StockPaperOutcomeProjection {
   totalObservations: number;
@@ -775,6 +781,139 @@ export class StockPaperRepository {
       .map((row) => parseJson<StockPaperObservation>(row.observation_json));
   }
 
+  /**
+   * Returns a bounded, deterministic sample across the complete chronological
+   * learning ledger. The old newest-N read eventually erased early evidence
+   * days as new rows crossed the limit. This sampler keeps the first evidence
+   * row from every UTC day and distributes the remaining capacity over the
+   * full timeline. Both endpoints of every UTC evidence day are anchors when
+   * capacity permits. If there are more anchors than capacity, the absolute
+   * oldest and newest observations remain fixed while the interior anchors are
+   * sampled across the full range. Outcomes are joined to those exact sampled
+   * identities, so the observation and label cohorts cannot drift apart.
+   *
+   * The temporary id table is connection-local and the transaction is fully
+   * synchronous. Canonical source rows are never changed or deleted.
+   */
+  learningEvidenceSample(
+    laneId: string,
+    limit = STOCK_PAPER_LEARNING_EVIDENCE_LIMIT
+  ): StockPaperLearningEvidenceSample {
+    if (!Number.isSafeInteger(limit) || limit < 2) {
+      throw new RangeError("Stock PAPER learning evidence limit must be a safe integer of at least two.");
+    }
+    return this.db.transaction(() => {
+      this.db.exec(`
+        CREATE TEMP TABLE IF NOT EXISTS stock_paper_learning_sample_ids(
+          id TEXT PRIMARY KEY
+        ) WITHOUT ROWID;
+        DELETE FROM stock_paper_learning_sample_ids;
+      `);
+      this.db.prepare(`
+        WITH normalized AS (
+          SELECT id, observed_at, substr(observed_at, 1, 10) AS evidence_day
+          FROM stock_paper_observations INDEXED BY stock_paper_observations_due
+          WHERE lane_id = @laneId
+        ),
+        day_ranked AS (
+          SELECT id, observed_at, evidence_day,
+                 row_number() OVER (
+                   PARTITION BY evidence_day ORDER BY observed_at, id
+                 ) AS day_row,
+                 count(*) OVER (PARTITION BY evidence_day) AS rows_in_day
+          FROM normalized
+        ),
+        anchors AS (
+          SELECT id, observed_at
+          FROM day_ranked
+          WHERE day_row = 1 OR day_row = rows_in_day
+        ),
+        parameters AS (
+          SELECT count(*) AS anchor_count
+          FROM anchors
+        ),
+        day_anchor_ranked AS (
+          SELECT id, observed_at,
+                 row_number() OVER (ORDER BY observed_at, id) AS anchor_row,
+                 count(*) OVER () AS total_anchors
+          FROM anchors
+        ),
+        middle_anchor_ranked AS (
+          SELECT id, observed_at,
+                 ntile(max(1, @limit - 2)) OVER (
+                   ORDER BY observed_at, id
+                 ) AS bucket
+          FROM day_anchor_ranked
+          WHERE anchor_row > 1 AND anchor_row < total_anchors
+            AND (SELECT anchor_count FROM parameters) > @limit
+            AND @limit > 2
+        ),
+        middle_anchor_sampled AS (
+          SELECT id, observed_at,
+                 row_number() OVER (
+                   PARTITION BY bucket ORDER BY observed_at, id
+                 ) AS bucket_row
+          FROM middle_anchor_ranked
+        ),
+        remaining_ranked AS (
+          SELECT id, observed_at,
+                 ntile(max(1, @limit - (SELECT anchor_count FROM parameters))) OVER (
+                   ORDER BY observed_at, id
+                 ) AS bucket
+          FROM day_ranked
+          WHERE day_row > 1 AND day_row < rows_in_day
+            AND (SELECT anchor_count FROM parameters) < @limit
+        ),
+        remaining_sampled AS (
+          SELECT id,
+                 row_number() OVER (
+                   PARTITION BY bucket ORDER BY observed_at, id
+                 ) AS bucket_row
+          FROM remaining_ranked
+        ),
+        sampled AS (
+          SELECT id
+          FROM anchors
+          WHERE (SELECT anchor_count FROM parameters) <= @limit
+          UNION ALL
+          SELECT id
+          FROM day_anchor_ranked
+          WHERE (SELECT anchor_count FROM parameters) > @limit
+            AND (anchor_row = 1 OR anchor_row = total_anchors)
+          UNION ALL
+          SELECT id
+          FROM middle_anchor_sampled
+          WHERE bucket_row = 1
+          UNION ALL
+          SELECT id
+          FROM remaining_sampled
+          WHERE bucket_row = 1
+        )
+        INSERT INTO stock_paper_learning_sample_ids(id)
+        SELECT id FROM sampled
+      `).run({ laneId, limit });
+
+      const observations = (this.db.prepare(`
+        SELECT observation.observation_json
+        FROM stock_paper_observations observation
+        JOIN stock_paper_learning_sample_ids sample ON sample.id = observation.id
+        WHERE observation.lane_id = ?
+        ORDER BY observation.observed_at, observation.id
+      `).all(laneId) as Array<{ observation_json: string }>)
+        .map((row) => parseJson<StockPaperObservation>(row.observation_json));
+      const outcomes = (this.db.prepare(`
+        SELECT outcome.outcome_json
+        FROM stock_paper_observation_outcomes outcome
+        JOIN stock_paper_learning_sample_ids sample ON sample.id = outcome.observation_id
+        WHERE outcome.lane_id = ?
+        ORDER BY outcome.labeled_at, outcome.observation_id, outcome.horizon_minutes
+      `).all(laneId) as Array<{ outcome_json: string }>)
+        .map((row) => parseJson<StockPaperObservationOutcome>(row.outcome_json));
+      this.db.exec("DELETE FROM stock_paper_learning_sample_ids;");
+      return { observations, outcomes };
+    })();
+  }
+
   observationIdsSince(laneId: string, since: string): Set<string> {
     return new Set((this.db.prepare(`
       SELECT id
@@ -1142,7 +1281,9 @@ export class StockPaperRepository {
           THEN COALESCE(json_extract(outcome.outcome_json, '$.missingReason'), 'UNKNOWN')
         END AS missing_reason
       FROM stock_paper_observations observation
+        INDEXED BY stock_paper_observations_dashboard_projection
       LEFT JOIN stock_paper_observation_outcomes outcome
+        INDEXED BY stock_paper_outcomes_dashboard_projection
         ON outcome.observation_id = observation.id
       WHERE observation.lane_id = ?
       ORDER BY observation.id, outcome.horizon_minutes

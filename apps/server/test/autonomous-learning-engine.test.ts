@@ -6,9 +6,10 @@ import {
   type QuoteRequest,
   type QuoteSnapshot
 } from "@copylab/shared";
-import type {
-  JupiterMarketStats,
-  JupiterMarketTokenSnapshot
+import {
+  JupiterQuoteError,
+  type JupiterMarketStats,
+  type JupiterMarketTokenSnapshot
 } from "@copylab/providers";
 import {
   AutonomousLearningEngine,
@@ -576,6 +577,117 @@ describe("autonomous executable shadow learning", () => {
     expect(active).not.toHaveProperty("nextQuoteAttemptAt");
     expect(learning.episodeCounts()).toMatchObject({ rejected: 0, unpriced: 0 });
     expect(quoteCalls).toBe(3);
+  });
+
+  it("terminalizes a non-retryable Jupiter no-route entry without warning churn", async () => {
+    mainDatabase = openDatabase(":memory:");
+    learningDatabase = openLearningDatabase(":memory:");
+    const repository = new Repository(mainDatabase);
+    const learning = new AutonomousLearningRepository(learningDatabase);
+    const lane = repository.createAutonomousPaperLane({
+      id: "no-route-entry-lane",
+      policyVersion: AUTONOMOUS_PAPER_POLICY_VERSION,
+      policy: { ...DEFAULT_AUTONOMOUS_PAPER_POLICY },
+      initialNavUsd: 141,
+      startedAt: CAPTURED_AT
+    });
+    repository.initializeAutonomousPaperAccount(lane.id, CAPTURED_AT);
+    const candidate = token("no-route-entry-mint");
+    const quote = vi.fn(async () => {
+      throw new JupiterQuoteError(
+        "NO_ROUTES_FOUND",
+        "no executable route exists for the requested pair and amount"
+      );
+    });
+    const onError = vi.fn();
+    const onUpdate = vi.fn();
+    const engine = new AutonomousLearningEngine(repository, learning, {
+      quote,
+      lookupMints: async () => [candidate],
+      solPriceUsd: () => 150,
+      now: () => new Date(CAPTURED_AT),
+      walletConfirmed: () => true,
+      onError,
+      onUpdate
+    });
+
+    engine.ingestUniverse({
+      lane,
+      universe: { capturedAt: CAPTURED_AT, tokens: [candidate] },
+      tokens: [candidate]
+    });
+    await engine.enqueueProcess();
+    await engine.enqueueProcess();
+
+    expect(learning.listEpisodes(["UNPRICED"])).toEqual([
+      expect.objectContaining({
+        mint: candidate.mint,
+        quoteAttempts: 1,
+        failureCode: expect.stringContaining("NO_ROUTES_FOUND")
+      })
+    ]);
+    expect(quote).toHaveBeenCalledOnce();
+    expect(onError).not.toHaveBeenCalled();
+    expect(onUpdate).toHaveBeenCalledWith(expect.objectContaining({
+      outcome: "SHADOW_UNPRICED",
+      mint: candidate.mint
+    }));
+  });
+
+  it("terminalizes an active shadow path when its executable exit route disappears", async () => {
+    mainDatabase = openDatabase(":memory:");
+    learningDatabase = openLearningDatabase(":memory:");
+    const repository = new Repository(mainDatabase);
+    const learning = new AutonomousLearningRepository(learningDatabase);
+    const lane = repository.createAutonomousPaperLane({
+      id: "no-route-follow-through-lane",
+      policyVersion: AUTONOMOUS_PAPER_POLICY_VERSION,
+      policy: { ...DEFAULT_AUTONOMOUS_PAPER_POLICY },
+      initialNavUsd: 141,
+      startedAt: CAPTURED_AT
+    });
+    repository.initializeAutonomousPaperAccount(lane.id, CAPTURED_AT);
+    const candidate = token("no-route-follow-through-mint");
+    let now = new Date(CAPTURED_AT);
+    let quoteCalls = 0;
+    const onError = vi.fn();
+    const engine = new AutonomousLearningEngine(repository, learning, {
+      quote: async (request) => {
+        quoteCalls += 1;
+        if (quoteCalls > 2) {
+          throw new JupiterQuoteError(
+            "NO_ROUTES_FOUND",
+            "no executable route exists for the requested pair and amount"
+          );
+        }
+        return quoteFor(request, now, 19.8);
+      },
+      lookupMints: async () => [candidate],
+      solPriceUsd: () => 150,
+      now: () => now,
+      walletConfirmed: () => true,
+      onError
+    });
+
+    engine.ingestUniverse({
+      lane,
+      universe: { capturedAt: CAPTURED_AT, tokens: [candidate] },
+      tokens: [candidate]
+    });
+    await engine.enqueueProcess();
+    expect(learning.listEpisodes(["ACTIVE"])).toHaveLength(1);
+
+    now = new Date("2026-07-15T00:05:00.000Z");
+    await engine.enqueueProcess();
+
+    expect(learning.listEpisodes(["UNPRICED"])).toEqual([
+      expect.objectContaining({
+        mint: candidate.mint,
+        failureCode: expect.stringContaining("NO_ROUTES_FOUND")
+      })
+    ]);
+    expect(quoteCalls).toBe(3);
+    expect(onError).not.toHaveBeenCalled();
   });
 
   it("rejects structural safety failures immediately and samples hard-safe negative controls as shadow only", async () => {

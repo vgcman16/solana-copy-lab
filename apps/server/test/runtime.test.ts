@@ -10,6 +10,7 @@ import {
 import {
   BirdeyeProvider,
   HeliusObserver,
+  HeliusWebSocketConnectionInterruptedError,
   JupiterMarketDataProvider,
   JupiterSwapProvider,
   JupiterTokenRiskProvider,
@@ -88,6 +89,39 @@ describe("TradingRuntime recovery controls", () => {
     await expect(runtime!.start()).resolves.toBeUndefined();
   });
 
+  it("keeps recovered generic Helius transport interruptions informational", () => {
+    const { repository } = setup();
+    const harness = runtime! as unknown as {
+      recordHeliusStreamIssue(event: string, error: Error): void;
+    };
+
+    harness.recordHeliusStreamIssue(
+      "helius_stream",
+      new HeliusWebSocketConnectionInterruptedError()
+    );
+    harness.recordHeliusStreamIssue(
+      "research_helius_stream",
+      new Error("Helius logsSubscribe acknowledgement timed out")
+    );
+
+    expect(repository.listAudit(10)).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        eventType: "helius_stream",
+        severity: "info",
+        message: "Helius WebSocket reported a connection error",
+        details: {
+          recovery: "RECONNECT_AND_GAP_REPAIR",
+          failClosed: true
+        }
+      }),
+      expect.objectContaining({
+        eventType: "research_helius_stream",
+        severity: "warning",
+        message: "Helius logsSubscribe acknowledgement timed out"
+      })
+    ]));
+  });
+
   it("isolates cleanup failures and drains delayed signal writes before stop resolves", async () => {
     const { repository } = setup();
     let releaseSignal!: () => void;
@@ -146,6 +180,9 @@ describe("TradingRuntime recovery controls", () => {
       providerWorkGeneration: number;
       providerWorkTasks: Set<Promise<unknown>>;
       assertProviderWorkCurrent(generation: number): void;
+      researchPaper: { options: { onError?: (error: Error) => void } };
+      autonomousLearning: { options: { onError?: (error: Error) => void } };
+      autonomousPaper: { options: { onError?: (error: Error) => void } };
     };
     let superseded: unknown;
     try {
@@ -154,6 +191,14 @@ describe("TradingRuntime recovery controls", () => {
       superseded = error;
     }
     expect(superseded).toMatchObject({ name: "ProviderWorkSupersededError" });
+    harness.researchPaper.options.onError?.(superseded as Error);
+    harness.autonomousLearning.options.onError?.(superseded as Error);
+    harness.autonomousPaper.options.onError?.(superseded as Error);
+    expect(repository.listAudit(10)).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ eventType: "research_paper" }),
+      expect.objectContaining({ eventType: "autonomous_learning" }),
+      expect.objectContaining({ eventType: "autonomous_paper" })
+    ]));
     const expectedRejection = Promise.reject(superseded);
     void expectedRejection.catch(() => undefined);
     harness.providerWorkTasks.add(expectedRejection);

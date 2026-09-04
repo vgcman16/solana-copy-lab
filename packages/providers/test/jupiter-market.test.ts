@@ -403,6 +403,42 @@ describe("JupiterMarketDataProvider", () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
+  it("retries one transient market read without multiplying account-wide 429 handling", async () => {
+    const sleep = vi.fn(async () => undefined);
+    const onRequest = vi.fn();
+    let attempts = 0;
+    const provider = new JupiterMarketDataProvider("key", {
+      retryBaseMs: 500,
+      sleep,
+      onRequest,
+      fetch: mockFetch(() => {
+        attempts += 1;
+        return attempts === 1
+          ? jsonResponse({ error: "temporary upstream failure" }, 503)
+          : jsonResponse([token(MINT_A)]);
+      })
+    });
+
+    await expect(provider.lookupMints([MINT_A])).resolves.toEqual([
+      expect.objectContaining({ mint: MINT_A })
+    ]);
+    expect(attempts).toBe(2);
+    expect(onRequest).toHaveBeenCalledTimes(2);
+    expect(sleep).toHaveBeenCalledOnce();
+    expect(sleep).toHaveBeenCalledWith(500);
+
+    let rateLimitedAttempts = 0;
+    const rateLimited = new JupiterMarketDataProvider("key", {
+      sleep,
+      fetch: mockFetch(() => {
+        rateLimitedAttempts += 1;
+        return jsonResponse({ error: "rate limited" }, 429);
+      })
+    });
+    await expect(rateLimited.lookupMints([MINT_A])).rejects.toMatchObject({ status: 429 });
+    expect(rateLimitedAttempts).toBe(1);
+  });
+
   it("includes all autonomous market categories in provider health", async () => {
     const paths: string[] = [];
     const provider = new JupiterMarketDataProvider("key", {

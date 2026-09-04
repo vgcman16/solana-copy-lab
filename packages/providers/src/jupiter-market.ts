@@ -2,6 +2,7 @@ import type { ProviderHealth, PublicKeyString } from "@copylab/shared";
 import {
   asRecord,
   finiteNumber,
+  ProviderApiError,
   requestJson,
   stringValue,
   type FetchLike
@@ -114,6 +115,12 @@ export interface JupiterMarketDataOptions {
   now?: () => Date;
   /** Invoked immediately before each physical Jupiter request. */
   onRequest?: (usage: JupiterMarketRequestUsage) => void;
+  /** One bounded retry is used only for transient transport/408/5xx failures.
+   * HTTP 429 is owned by the shared account-wide pacing queue and is never
+   * multiplied here. */
+  maximumTransientRetries?: number;
+  retryBaseMs?: number;
+  sleep?: (milliseconds: number) => Promise<void>;
 }
 
 const CATEGORY_PATHS = Object.freeze({
@@ -479,6 +486,9 @@ export class JupiterMarketDataProvider {
   private readonly timeoutMs: number;
   private readonly now: () => Date;
   private readonly onRequest: ((usage: JupiterMarketRequestUsage) => void) | undefined;
+  private readonly maximumTransientRetries: number;
+  private readonly retryBaseMs: number;
+  private readonly sleep: (milliseconds: number) => Promise<void>;
 
   constructor(
     private readonly apiKey: string,
@@ -490,6 +500,21 @@ export class JupiterMarketDataProvider {
     this.timeoutMs = options.timeoutMs ?? 10_000;
     this.now = options.now ?? (() => new Date());
     this.onRequest = options.onRequest;
+    this.maximumTransientRetries = options.maximumTransientRetries ?? 1;
+    this.retryBaseMs = options.retryBaseMs ?? 500;
+    this.sleep = options.sleep ?? ((milliseconds) =>
+      new Promise((resolve) => setTimeout(resolve, milliseconds))
+    );
+    if (
+      !Number.isSafeInteger(this.maximumTransientRetries) ||
+      this.maximumTransientRetries < 0 ||
+      this.maximumTransientRetries > 2
+    ) {
+      throw new RangeError("Jupiter market maximumTransientRetries must be between 0 and 2");
+    }
+    if (!Number.isFinite(this.retryBaseMs) || this.retryBaseMs < 0 || this.retryBaseMs > 10_000) {
+      throw new RangeError("Jupiter market retryBaseMs must be between 0 and 10000 milliseconds");
+    }
   }
 
   async fetchSignalUniverse(limit = MAX_CATEGORY_LIMIT): Promise<JupiterMarketUniverseSnapshot> {
@@ -648,14 +673,23 @@ export class JupiterMarketDataProvider {
     return new URL(`${this.baseUrl}${path}`);
   }
 
-  private request(url: URL, metricPath: string): Promise<unknown> {
-    this.onRequest?.({ path: metricPath, requests: 1 });
-    return requestJson<unknown>(url, {
-      headers: { "x-api-key": this.apiKey, accept: "application/json" }
-    }, {
-      provider: "Jupiter Markets",
-      fetch: this.fetch,
-      timeoutMs: this.timeoutMs
-    });
+  private async request(url: URL, metricPath: string): Promise<unknown> {
+    for (let attempt = 0; ; attempt += 1) {
+      this.onRequest?.({ path: metricPath, requests: 1 });
+      try {
+        return await requestJson<unknown>(url, {
+          headers: { "x-api-key": this.apiKey, accept: "application/json" }
+        }, {
+          provider: "Jupiter Markets",
+          fetch: this.fetch,
+          timeoutMs: this.timeoutMs
+        });
+      } catch (error) {
+        const transient = error instanceof ProviderApiError &&
+          error.retryable && error.status !== 429;
+        if (!transient || attempt >= this.maximumTransientRetries) throw error;
+        await this.sleep(this.retryBaseMs * 2 ** attempt);
+      }
+    }
   }
 }

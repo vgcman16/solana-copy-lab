@@ -176,7 +176,7 @@ describe("schema v45 marketplace evidence migration", () => {
     legacy.close();
 
     db = openDatabase(path);
-    expect(COPYLAB_SCHEMA_VERSION).toBe(47);
+    expect(COPYLAB_SCHEMA_VERSION).toBe(48);
     expect(db.pragma("user_version", { simple: true })).toBe(COPYLAB_SCHEMA_VERSION);
     expect(db.pragma("foreign_key_check")).toEqual([]);
     const marketplace = new MarketplaceService(db);

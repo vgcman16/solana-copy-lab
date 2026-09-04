@@ -23,10 +23,17 @@ import {
   type TradeAttribution,
   type WalkForwardResult
 } from "@copylab/shared";
-import type {
-  JupiterMarketTokenSnapshot,
-  JupiterMarketUniverseSnapshot
+import {
+  isJupiterNoRouteError,
+  type JupiterMarketTokenSnapshot,
+  type JupiterMarketUniverseSnapshot
 } from "@copylab/providers";
+/*
+ * NO_ROUTES_FOUND is terminal evidence about one pair/amount, not a provider
+ * outage. Keeping it typed lets the learning ledger retain the negative
+ * executable-liquidity evidence without retrying a known terminal request or
+ * turning an expected market outcome into an operational warning.
+ */
 import type { Repository } from "./repository.js";
 import { AutonomousLearningRepository, LEARNING_SCHEMA_VERSION } from "./learning-database.js";
 import {
@@ -1112,7 +1119,8 @@ export class AutonomousLearningEngine {
       const reason = error instanceof Error ? error.message.slice(0, 160) : "LEARNING_QUOTE_FAILED";
       const attempts = (episode.quoteAttempts ?? 0) + 1;
       const structural = reason === "LEARNING_TOKEN_SAFETY_FAILED";
-      const retryable = !structural && attempts < MAXIMUM_ENTRY_QUOTE_ATTEMPTS;
+      const noRoute = isJupiterNoRouteError(error);
+      const retryable = !structural && !noRoute && attempts < MAXIMUM_ENTRY_QUOTE_ATTEMPTS;
       const failed: ShadowEpisode = {
         ...episode,
         status: structural ? "REJECTED" : retryable ? "PENDING_QUOTE" : "UNPRICED",
@@ -1125,7 +1133,16 @@ export class AutonomousLearningEngine {
         } : {}),
         updatedAt: now.toISOString()
       };
+      if (!retryable) delete failed.nextQuoteAttemptAt;
       this.learning.upsertEpisode(failed);
+      if (noRoute) {
+        this.options.onUpdate?.({
+          outcome: "SHADOW_UNPRICED",
+          episodeId: failed.id,
+          mint: failed.mint
+        });
+        return;
+      }
       throw error;
     }
   }
@@ -1221,7 +1238,26 @@ export class AutonomousLearningEngine {
       try {
         await this.observeEpisode(episode);
       } catch (error) {
-        this.options.onError?.(error instanceof Error ? error : new Error("Learning follow-through quote failed safely."));
+        if (isJupiterNoRouteError(error)) {
+          const updatedAt = this.now().toISOString();
+          const unpriced: ShadowEpisode = {
+            ...episode,
+            status: "UNPRICED",
+            failureCode: error.message.slice(0, 160),
+            updatedAt
+          };
+          delete unpriced.nextQuoteAttemptAt;
+          this.learning.upsertEpisode(unpriced);
+          this.options.onUpdate?.({
+            outcome: "SHADOW_UNPRICED",
+            episodeId: unpriced.id,
+            mint: unpriced.mint
+          });
+        } else {
+          this.options.onError?.(error instanceof Error
+            ? error
+            : new Error("Learning follow-through quote failed safely."));
+        }
       }
       workUnits -= 1;
     }

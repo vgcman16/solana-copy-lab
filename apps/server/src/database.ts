@@ -4,7 +4,7 @@ import { dirname, resolve } from "node:path";
 
 export type CopyLabDatabase = Database.Database;
 
-export const COPYLAB_SCHEMA_VERSION = 47;
+export const COPYLAB_SCHEMA_VERSION = 48;
 export const STOCK_V41_EVIDENCE_ACTIVATION_SETTING_KEY =
   "stock_paper_v41_evidence_activation";
 
@@ -415,6 +415,38 @@ function migrateSolPriceObservationV47(db: CopyLabDatabase): void {
   })();
 }
 
+/**
+ * The stock learning dashboard needs only the observation phase and the
+ * missing-outcome reason from two comparatively large JSON ledgers. Cover the
+ * exact expressions used by that projection so a dashboard refresh never has
+ * to read and parse every multi-kilobyte evidence document. The canonical JSON
+ * remains untouched and continues to feed learning, audit, and replay logic.
+ */
+function migrateStockDashboardProjectionIndexesV48(db: CopyLabDatabase): void {
+  db.transaction(() => {
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS stock_paper_observations_dashboard_projection
+        ON stock_paper_observations(
+          lane_id,
+          id,
+          observed_at,
+          json_extract(observation_json, '$.phase')
+        );
+
+      CREATE INDEX IF NOT EXISTS stock_paper_outcomes_dashboard_projection
+        ON stock_paper_observation_outcomes(
+          observation_id,
+          horizon_minutes,
+          status,
+          CASE WHEN status = 'MISSING'
+            THEN COALESCE(json_extract(outcome_json, '$.missingReason'), 'UNKNOWN')
+          END
+        );
+    `);
+    db.pragma("user_version = 48");
+  })();
+}
+
 function migrate(db: CopyLabDatabase): void {
   const version = db.pragma("user_version", { simple: true }) as number;
   if (version > COPYLAB_SCHEMA_VERSION) {
@@ -427,8 +459,15 @@ function migrate(db: CopyLabDatabase): void {
     return;
   }
 
+  if (version === 47) {
+    migrateStockDashboardProjectionIndexesV48(db);
+    ensureStockV41EvidenceActivationMarker(db);
+    return;
+  }
+
   if (version === 46) {
     migrateSolPriceObservationV47(db);
+    migrateStockDashboardProjectionIndexesV48(db);
     ensureStockV41EvidenceActivationMarker(db);
     return;
   }
@@ -436,6 +475,7 @@ function migrate(db: CopyLabDatabase): void {
   if (version === 45) {
     migrateAutonomousDashboardIndexesV46(db);
     migrateSolPriceObservationV47(db);
+    migrateStockDashboardProjectionIndexesV48(db);
     ensureStockV41EvidenceActivationMarker(db);
     return;
   }
@@ -1812,6 +1852,27 @@ function migrate(db: CopyLabDatabase): void {
 
     CREATE INDEX IF NOT EXISTS stock_paper_outcomes_lane_time
       ON stock_paper_observation_outcomes(lane_id, labeled_at DESC);
+
+    -- The dashboard consumes only two compact JSON-derived fields from these
+    -- append-only evidence ledgers. Exact covering expression indexes preserve
+    -- the full source documents while keeping the frequent projection bounded.
+    CREATE INDEX IF NOT EXISTS stock_paper_observations_dashboard_projection
+      ON stock_paper_observations(
+        lane_id,
+        id,
+        observed_at,
+        json_extract(observation_json, '$.phase')
+      );
+
+    CREATE INDEX IF NOT EXISTS stock_paper_outcomes_dashboard_projection
+      ON stock_paper_observation_outcomes(
+        observation_id,
+        horizon_minutes,
+        status,
+        CASE WHEN status = 'MISSING'
+          THEN COALESCE(json_extract(outcome_json, '$.missingReason'), 'UNKNOWN')
+        END
+      );
 
     -- v43 also records explicit simulated capital contributions. They may
     -- increase only the isolated research account and are separated from

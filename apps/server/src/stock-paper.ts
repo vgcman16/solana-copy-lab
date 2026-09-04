@@ -739,7 +739,8 @@ export class StockPaperEngine {
   }
 
   private async runLearningEvaluation(laneId: string, cutoffAt: string): Promise<void> {
-    const verifiedObservations = this.repository.observations(laneId, 20_000)
+    const evidence = this.repository.learningEvidenceSample(laneId);
+    const verifiedObservations = evidence.observations
       .flatMap((observation): StockPaperLearningObservationV3[] => {
         const verified = verifiedLearningEvidence(observation);
         return verified ? [verified] : [];
@@ -747,7 +748,7 @@ export class StockPaperEngine {
     const observationById = new Map(
       verifiedObservations.map((observation) => [observation.id, observation])
     );
-    const verifiedOutcomes = this.repository.observationOutcomes(laneId, 60_000)
+    const verifiedOutcomes = evidence.outcomes
       .flatMap((outcome): StockPaperOutcomeLabelV3[] => {
         const observation = observationById.get(outcome.observationId);
         if (!observation) return [];
